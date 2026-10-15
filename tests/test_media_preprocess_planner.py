@@ -390,6 +390,8 @@ def test_parser_accepts_both_documented_shapes():
         {"segment": ["a", "b"], "category": "sponsor", "actionType": "skip"},
         {"segment": [5.0, 1.0], "category": "sponsor", "actionType": "skip"},
         {"segment": [-5.0, 1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": [float("nan"), 1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": [1.0, float("inf")], "category": "sponsor", "actionType": "skip"},
         {"segment": [1.0, 2.0], "actionType": "skip"},
         {"segment": [1.0, 2.0], "category": "sponsor"},
     ],

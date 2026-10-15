@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Any
 
@@ -71,6 +72,9 @@ def _parse_segment(entry: dict[str, Any]) -> SponsorSegment | None:
     try:
         start, end = float(pair[0]), float(pair[1])
     except (TypeError, ValueError):
+        return None
+    # NaN 与 inf 能通过 float()，但所有比较都是 False，会悄悄产出一条乱序裁切
+    if not (math.isfinite(start) and math.isfinite(end)):
         return None
     if start < 0 or end <= start:
         return None
