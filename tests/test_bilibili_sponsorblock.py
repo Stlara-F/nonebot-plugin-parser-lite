@@ -1,0 +1,421 @@
+"""B 站空降：标注查询、区间换算，以及下载完成后产出成片。
+
+这块是平台特有能力，只被 bilibili 解析器调用；通用倍速在 test_media_speedup.py。
+"""
+
+from pathlib import Path
+
+from anyio import Path as AnyPath
+import pytest
+import render_test_support as support
+
+from nonebot_plugin_parser_lite.config import SPONSORBLOCK_CATEGORIES, Config
+from nonebot_plugin_parser_lite.constants import MIN_KEEP_PIECE_SECONDS
+from nonebot_plugin_parser_lite.parsers.bilibili import sponsorblock
+from nonebot_plugin_parser_lite.parsers.bilibili.sponsorblock import (
+    _iter_segment_dicts,
+    _normalize_ranges,
+    _parse_segment,
+    fetch_segments,
+    skip_for_video,
+    skip_ranges,
+    skip_video,
+)
+from nonebot_plugin_parser_lite.utils.ffmpeg import FFmpeg
+
+ROW = {"segment": [1.0, 5.0], "category": "sponsor", "actionType": "skip"}
+
+
+def row(start, end, category="sponsor", action="skip", recorded=600.0):
+    return {"segment": [start, end], "category": category, "actionType": action, "videoDuration": recorded}
+
+
+class _Response:
+    def __init__(self, status_code=200, payload=None, raw="not json"):
+        self.status_code = status_code
+        self._payload = payload
+        self._raw = raw
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError(self._raw)
+        return self._payload
+
+
+class _Client:
+    """替掉 httpx.AsyncClient，不发网络请求"""
+
+    def __init__(self, response: _Response, error: Exception | None = None):
+        self.response = response
+        self.error = error
+        self.requests: list[tuple[str, dict]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def get(self, url, params=None):
+        self.requests.append((url, params or {}))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+# --------------------------------------------------------------------------
+# 返回体解析
+
+
+def test_parser_accepts_both_documented_shapes():
+    flat = [ROW]
+    grouped = [{"videoID": "BV1", "segments": [row(2, 9, "intro", "mute")]}]
+    assert _iter_segment_dicts(flat) == [ROW]
+    parsed = _parse_segment(_iter_segment_dicts(grouped)[0])
+    assert parsed is not None
+    assert (parsed.start, parsed.end, parsed.action_type) == (2.0, 9.0, "mute")
+    # 分类与 actionType 大小写不敏感
+    assert _parse_segment(row(1, 2, "Sponsor", "Skip")).category == "sponsor"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {},
+        {"segment": [1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": ["a", "b"], "category": "sponsor", "actionType": "skip"},
+        {"segment": [5.0, 1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": [-5.0, 1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": [float("nan"), 1.0], "category": "sponsor", "actionType": "skip"},
+        {"segment": [1.0, float("inf")], "category": "sponsor", "actionType": "skip"},
+        {"segment": [1.0, 2.0], "actionType": "skip"},
+        {"segment": [1.0, 2.0], "category": "sponsor"},
+    ],
+)
+def test_malformed_segment_is_rejected(entry):
+    assert _parse_segment(entry) is None
+
+
+def test_zero_recorded_duration_means_unknown():
+    """上游约定 videoDuration 为 0 表示提交时不知道时长，不能当成 0 秒"""
+    parsed = _parse_segment(row(1.0, 5.0, recorded=0))
+    assert parsed is not None
+    assert parsed.recorded_duration is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_builds_the_query_and_returns_rows(monkeypatch):
+    client = _Client(_Response(200, [row(1.0, 5.0)]))
+    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+
+    segments = await fetch_segments(
+        "https://bsbsb.top/", "BV1", "9", ["sponsor", "intro"]
+    )
+    url, params = client.requests[0]
+    assert url == "https://bsbsb.top/api/skipSegments"
+    assert params == {
+        "videoID": "BV1",
+        "cid": "9",
+        "categories": '["sponsor", "intro"]',
+    }
+    assert [seg.start for seg in segments] == [1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "client",
+    [
+        _Client(_Response(404)),
+        _Client(_Response(400)),
+        _Client(_Response(200, payload=None)),
+        _Client(_Response(200, payload={"unexpected": "object"})),
+        _Client(_Response(200, payload=[{"segment": ["x", "y"]}]), None),
+    ],
+)
+async def test_fetch_degrades_to_empty(monkeypatch, client):
+    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    assert await fetch_segments("https://bsbsb.top", "BV1", "9", ["sponsor"]) == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_swallows_transport_errors(monkeypatch):
+    client = _Client(_Response(), error=OSError("connection reset"))
+    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    assert await fetch_segments("https://bsbsb.top", "BV1", "9", ["sponsor"]) == []
+
+
+# --------------------------------------------------------------------------
+# 区间换算
+
+
+def test_normalize_ranges_clamps_sorts_and_merges():
+    merged = _normalize_ranges(
+        [
+            (500.0, 520.0),
+            (100.0, 160.0),
+            (150.0, 180.0),
+            (-10.0, 20.0),
+            (590.0, 900.0),
+        ],
+        600.0,
+    )
+    assert merged == ((0.0, 20.0), (100.0, 180.0), (500.0, 520.0), (590.0, 600.0))
+
+
+@pytest.mark.parametrize(
+    ("cuts", "expected"),
+    [
+        ([(10.0, 20.0), (20.02, 30.0)], ((10.0, 30.0),)),
+        ([(0.03, 30.0)], ((0.0, 30.0),)),
+        ([(0.06, 30.0)], ((0.06, 30.0),)),
+    ],
+)
+def test_tiny_retained_pieces_are_absorbed(cuts, expected):
+    """转码层会丢掉太短的碎片，区间就得先并掉，换算出的时长才对得上"""
+    merged = _normalize_ranges(cuts, 600.0, MIN_KEEP_PIECE_SECONDS)
+    assert merged == expected
+    kept = FFmpeg._build_keep_pieces(merged, 600.0)
+    assert sum(end - start for start, end in kept) == 600.0 - sum(
+        end - start for start, end in merged
+    )
+
+
+async def _skip_rows(monkeypatch, rows, duration=600.0):
+    client = _Client(_Response(200, rows))
+    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    return await skip_ranges("https://x.top", ["sponsor", "intro"], "BV1", "9", duration)
+
+
+@pytest.mark.asyncio
+async def test_ranges_are_split_by_action_type(monkeypatch):
+    cuts, mutes, removed = await _skip_rows(
+        monkeypatch,
+        [
+            row(0.0, 30.0, "sponsor", "skip"),
+            row(60.0, 75.0, "intro", "mute"),
+            row(90.0, 100.0, "sponsor", "full"),
+            row(120.0, 130.0, "intro", "poi"),
+        ],
+    )
+    assert cuts == ((0.0, 30.0),)
+    assert mutes == ((60.0, 75.0),)
+    assert removed == pytest.approx(30.0)
+
+
+@pytest.mark.asyncio
+async def test_unselected_category_is_ignored(monkeypatch):
+    """服务端可能返回同视频其他分类的标注，只处理白名单内的"""
+    cuts, mutes, removed = await _skip_rows(
+        monkeypatch, [row(0.0, 30.0, "filler", "skip")]
+    )
+    assert (cuts, mutes, removed) == ((), (), 0.0)
+
+
+@pytest.mark.asyncio
+async def test_staleness_is_checked_per_segment(monkeypatch):
+    cuts, _, _ = await _skip_rows(
+        monkeypatch,
+        [
+            row(10.0, 20.0, recorded=600.0),
+            row(30.0, 40.0, recorded=520.0),
+            row(50.0, 60.0, recorded=0.0),
+        ],
+    )
+    # 第二条标注的是旧版本，误差超过 ±2 秒就丢弃
+    assert cuts == ((10.0, 20.0), (50.0, 60.0))
+
+
+@pytest.mark.asyncio
+async def test_unknown_recorded_duration_is_not_falsified(monkeypatch):
+    cuts, _, _ = await _skip_rows(monkeypatch, [{"segment": [10.0, 20.0], "category": "sponsor", "actionType": "skip"}])
+    assert cuts == ((10.0, 20.0),)
+
+
+@pytest.mark.asyncio
+async def test_cuts_covering_the_whole_video_are_abandoned(monkeypatch):
+    cuts, mutes, removed = await _skip_rows(monkeypatch, [row(0.0, 600.0)])
+    assert cuts == ()
+    assert mutes == ()
+    assert removed == 0.0
+
+
+@pytest.mark.asyncio
+async def test_tiny_pieces_are_absorbed_by_the_planner(monkeypatch):
+    """碎片阈值必须在 skip_ranges 里带上，而不只是纯函数里正确"""
+    cuts, _, removed = await _skip_rows(
+        monkeypatch, [row(10.0, 20.0), row(20.02, 30.0)]
+    )
+    assert cuts == ((10.0, 30.0),)
+    assert removed == pytest.approx(20.0)
+
+
+# --------------------------------------------------------------------------
+# 分类白名单
+
+
+def test_categories_whitelist_equals_the_service_ids():
+    """白名单必须等于服务端接受的分类
+
+    传未知分类时服务用 400 拒绝整个请求（实测返回 ``["Unknown category provided."]``），
+    而不是只忽略那一项，留一个服务端不认的写法就等于让空降静默失效。
+    """
+    assert SPONSORBLOCK_CATEGORIES == {
+        "sponsor",
+        "selfpromo",
+        "exclusive_access",
+        "interaction",
+        "poi_highlight",
+        "intro",
+        "outro",
+        "preview",
+        "padding",
+        "filler",
+        "music_offtopic",
+    }
+
+
+def test_unknown_category_is_rejected_at_startup():
+    with pytest.raises(ValueError, match="未知的片段分类"):
+        Config(plite_sponsorblock_categories=["branding"])
+    with pytest.raises(ValueError, match="以 http 开头"):
+        Config(plite_sponsorblock_api_base="bsbsb.top")
+
+
+# --------------------------------------------------------------------------
+# 解析阶段的入口：配置门控
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_base", "categories", "cid", "duration"),
+    [
+        (None, ["sponsor"], 9, 600.0),
+        ("https://x.top", [], 9, 600.0),
+        ("https://x.top", ["sponsor"], None, 600.0),
+        ("https://x.top", ["sponsor"], 9, 0.0),
+    ],
+)
+async def test_skip_is_disabled_without_config_or_identity(
+    monkeypatch, api_base, categories, cid, duration
+):
+    async def never(*args, **kwargs):
+        raise AssertionError("不该发起查询")
+
+    monkeypatch.setattr(sponsorblock, "skip_ranges", never)
+    monkeypatch.setattr(support.pconfig, "plite_sponsorblock_api_base", api_base)
+    monkeypatch.setattr(support.pconfig, "plite_sponsorblock_categories", categories)
+    assert await skip_for_video("BV1", cid, duration) == ((), (), 0.0)
+
+
+@pytest.mark.asyncio
+async def test_skip_for_video_passes_the_resolved_identity(monkeypatch):
+    seen: list[tuple] = []
+
+    async def spy(api_base, categories, bvid, cid, duration):
+        seen.append((api_base, tuple(categories), bvid, cid, duration))
+        return ((1.0, 2.0),), ((3.0, 4.0),), 1.0
+
+    monkeypatch.setattr(sponsorblock, "skip_ranges", spy)
+    monkeypatch.setattr(
+        support.pconfig, "plite_sponsorblock_api_base", "https://x.top"
+    )
+    monkeypatch.setattr(support.pconfig, "plite_sponsorblock_categories", ["sponsor"])
+
+    cuts, mutes, removed = await skip_for_video("BV1", 9, 600.0)
+    # cid 是整数，查询要拿到字符串形式
+    assert seen == [("https://x.top", ("sponsor",), "BV1", "9", 600.0)]
+    assert (cuts, mutes, removed) == (((1.0, 2.0),), ((3.0, 4.0),), 1.0)
+
+
+# --------------------------------------------------------------------------
+# 下载完成后产出成片
+
+
+@pytest.mark.asyncio
+async def test_skip_video_returns_source_when_nothing_to_do(tmp_path, monkeypatch):
+    """没有区间就不该起转码
+
+    edit_video 用记录而不是抛异常：skip_video 会把异常吞成「退回原片」，
+    抛断言的用例写法等于什么都没测。
+    """
+    async def always(cls):
+        return True
+
+    called: list[int] = []
+
+    async def spy(cls, *args, **kwargs):
+        called.append(1)
+        return AnyPath(tmp_path / "product.mp4")
+
+    monkeypatch.setattr(FFmpeg, "is_available", classmethod(always))
+    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(spy))
+    source = AnyPath(tmp_path / "source.mp4")
+    assert await skip_video(source, (), ()) == source
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_skip_video_skips_when_ffmpeg_is_missing(tmp_path, monkeypatch):
+    async def unavailable(cls):
+        return False
+
+    called: list[int] = []
+
+    async def spy(cls, *args, **kwargs):
+        called.append(1)
+        return AnyPath(tmp_path / "product.mp4")
+
+    monkeypatch.setattr(FFmpeg, "is_available", classmethod(unavailable))
+    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(spy))
+    source = AnyPath(tmp_path / "source.mp4")
+    assert await skip_video(source, ((1.0, 2.0),), ()) == source
+    assert called == [], "缺 ffmpeg 时不该调用转码"
+
+
+@pytest.mark.asyncio
+async def test_skip_video_falls_back_to_original_on_failure(tmp_path, monkeypatch):
+    async def always(cls):
+        return True
+
+    async def failing(cls, *args, **kwargs):
+        raise RuntimeError("ffmpeg 执行失败")
+
+    monkeypatch.setattr(FFmpeg, "is_available", classmethod(always))
+    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(failing))
+    source = AnyPath(tmp_path / "source.mp4")
+    assert await skip_video(source, ((1.0, 2.0),), ((3.0, 4.0),)) == source
+
+
+@pytest.mark.asyncio
+async def test_skip_video_names_the_product_after_the_annotations(
+    tmp_path, monkeypatch
+):
+    async def always(cls):
+        return True
+
+    seen: dict[str, object] = {}
+
+    async def spy(cls, input_path, file_name, **kwargs):
+        seen.update(kwargs, file_name=file_name)
+        product = tmp_path / f"{file_name}.mp4"
+        product.write_bytes(b"edited")
+        return AnyPath(product)
+
+    monkeypatch.setattr(FFmpeg, "is_available", classmethod(always))
+    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(spy))
+    monkeypatch.setattr(support.pconfig, "plite_max_size", 77)
+
+    source = AnyPath(tmp_path / "source.mp4")
+    cuts = ((1.0, 2.0),)
+    mutes = ((3.0, 4.0),)
+    product = Path(str(await skip_video(source, cuts, mutes)))
+    assert product.name.startswith("source-skip-")
+    assert ":" not in product.name, "Windows 的文件名不允许冒号"
+    assert seen["cut_ranges"] == cuts
+    assert seen["mute_ranges"] == mutes
+    assert seen["max_size_mb"] == 77
+
+    # 标注换一批就换产物，不能命中上一次的成片
+    seen.clear()
+    other = Path(str(await skip_video(source, ((1.0, 2.5),), mutes)))
+    assert other != product

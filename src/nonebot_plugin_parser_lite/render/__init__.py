@@ -36,7 +36,7 @@ from ..exception import (
 from ..helper import ForwardNodeInner, UniHelper, UniMessage, mark_media_role
 from ..utils.cache import CacheManager
 from ..utils.ffmpeg import FFmpeg
-from ..utils.media_edit import edit_digests
+from ..utils.media_edit import speedup_digest
 from .context import PLACEHOLDER_IMAGE, ThemeData, build_theme_data, safe_src
 from .theme import ThemeDefinition, ThemeManager
 
@@ -771,7 +771,7 @@ class Renderer:
     async def cache_or_render_image(self, result: ParseResult):
         """获取缓存图片（支持跨重启复用）
 
-        以当前主题、解析结果 URL 与上传前编辑计划为 key，在 cache_dir 下生成
+        以当前主题、解析结果 URL 与上传前倍速为 key，在 cache_dir 下生成
         稳定文件名：
         - 若文件已存在：直接使用，不再重新渲染
         - 若不存在：渲染并写入该文件
@@ -779,12 +779,12 @@ class Renderer:
         theme = get_theme()
         selected_theme = await self._resolve_theme()
         render_format = pconfig.render_format
-        # 卡片上的时长与体积按编辑计划换算，计划变了就得重渲染
-        plan_key = edit_digests(result)
+        # 卡片上的时长与体积按倍速换算，倍速变了就得重渲染
+        speed_key = speedup_digest(result)
         cache_key = (
             f"{RENDER_TEMPLATE_VERSION}:{selected_theme.id}:"
             f"{selected_theme.version}:{theme}:{result.url}"
-            + (f":{plan_key}" if plan_key else "")
+            + (f":{speed_key}" if speed_key else "")
         )
         file_name = f"{uuid.uuid5(uuid.NAMESPACE_URL, cache_key)}.{render_format}"
         cache_dir = await CacheManager.ensure_dir(CacheManager.RENDER)

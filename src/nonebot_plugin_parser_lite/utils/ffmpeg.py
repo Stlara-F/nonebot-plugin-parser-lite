@@ -17,20 +17,6 @@ from ..exception import SizeLimitException
 from .cache import CacheManager
 from .common import fmt_size
 
-AUDIO_CODECS: dict[str, tuple[str, ...]] = {
-    ".mp3": ("-c:a", "libmp3lame", "-q:a", "2"),
-    ".m4a": ("-c:a", "aac", "-b:a", "192k"),
-    ".mp4": ("-c:a", "aac", "-b:a", "192k"),
-    ".m4s": ("-c:a", "aac", "-b:a", "192k"),
-    ".mov": ("-c:a", "aac", "-b:a", "192k"),
-    ".aac": ("-c:a", "aac", "-b:a", "192k"),
-    ".wav": ("-c:a", "pcm_s16le"),
-    ".ogg": ("-c:a", "libvorbis"),
-    ".opus": ("-c:a", "libopus"),
-    ".flac": ("-c:a", "flac"),
-}
-"""音频重编码参数，按扩展名选；变速必须重编码，容器沿用源文件"""
-
 MP4_LIKE_SUFFIXES = {".mp4", ".m4a", ".m4s", ".mov"}
 
 _gate_loop: asyncio.AbstractEventLoop | None = None
@@ -729,22 +715,6 @@ class FFmpeg:
         return "+".join(terms)
 
     @classmethod
-    def _build_tempo_chain(cls, ratio: float) -> str:
-        """把倍率拆成若干级 atempo：单级只保证 0.5~2.0，老版本超出就直接拒"""
-        if ratio <= 0:
-            raise RuntimeError(f"非法的倍率: {ratio}")
-        stages: list[float] = []
-        remaining = ratio
-        while remaining > 2.0:
-            stages.append(2.0)
-            remaining /= 2.0
-        while remaining < 0.5:
-            stages.append(0.5)
-            remaining /= 0.5
-        stages.append(remaining)
-        return ",".join(f"atempo={cls._format_filter_number(stage)}" for stage in stages)
-
-    @classmethod
     def _build_timeline_filter(
         cls,
         pieces: list[tuple[float, float]],
@@ -814,10 +784,10 @@ class FFmpeg:
         mute_ranges: tuple[tuple[float, float], ...] = (),
         max_size_mb: int = 90,
     ) -> Path:
-        """按编辑计划重编码视频，一次 ffmpeg 调用产出终态文件
+        """重编码视频，一次 ffmpeg 调用产出终态文件
 
-        变速与裁切合并在同一条滤镜链里，避免两代有损编码；只消音时视频流直接
-        复制。产物名由调用方给出，命中缓存即复用。
+        倍速、裁切、消音可以同时传，落在同一条滤镜链里，避免多代有损编码；只消音
+        时视频流直接复制。产物名由调用方给出，命中缓存即复用。
 
         :param input_path: 源视频路径
         :param file_name: 输出文件名（不含扩展名）
@@ -870,8 +840,10 @@ class FFmpeg:
             )
             video_target = "[vf]"
             if audio_target is not None:
-                tempo = cls._build_tempo_chain(speed_ratio)
-                filter_parts.append(f"{_pad(audio_target)}{tempo}[af]")
+                filter_parts.append(
+                    f"{_pad(audio_target)}atempo="
+                    f"{cls._format_filter_number(speed_ratio)}[af]"
+                )
                 audio_target = "[af]"
 
         cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
@@ -943,10 +915,15 @@ class FFmpeg:
         if await output_path.exists():
             return output_path
 
-        tempo = cls._build_tempo_chain(speed_ratio)
         cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
-        cmd += ["-i", str(input_path), "-vn", "-af", tempo]
-        cmd += list(AUDIO_CODECS.get(suffix, ("-c:a", "aac", "-b:a", "192k")))
+        cmd += [
+            "-i",
+            str(input_path),
+            "-vn",
+            "-af",
+            f"atempo={cls._format_filter_number(speed_ratio)}",
+        ]
+        # 编码器与码率交给 ffmpeg 按输出后缀决定
         if suffix in MP4_LIKE_SUFFIXES:
             cmd += ["-movflags", "+faststart"]
         logger.info(f"Editing audio '{input_path.name}' as '{output_path.name}'")

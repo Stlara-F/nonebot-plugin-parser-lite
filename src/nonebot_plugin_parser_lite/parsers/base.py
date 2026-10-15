@@ -380,7 +380,6 @@ class BaseParser:
         ext_headers: dict[str, str] | None = None,
         use_curl_cffi: bool = False,
         cache_key: str | None = None,
-        origin_ids: dict[str, str] | None = None,
     ):
         """
         创建视频内容,
@@ -391,7 +390,6 @@ class BaseParser:
         :param cover_url: 封面 URL
         :param duration: 视频时长
         :param cache_key: 稳定缓存标识，为空时根据各自 URL 生成
-        :param origin_ids: 平台侧稳定标识（如 bvid / cid），供上传前预处理查表
         :param need_send: 是否发送
         :param ext_headers: 额外请求头
         :param use_curl_cffi: 是否使用 curl_cffi 下载视频/封面
@@ -405,7 +403,6 @@ class BaseParser:
             ext_headers=ext_headers,
             use_curl_cffi=use_curl_cffi,
             cache_key=cache_key,
-            origin_ids=origin_ids,
         )
 
     def create_videos(

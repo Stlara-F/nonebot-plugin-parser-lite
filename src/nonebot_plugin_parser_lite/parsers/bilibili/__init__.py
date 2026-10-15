@@ -61,6 +61,7 @@ from .dynamic import (
     build_dynamic,
 )
 from .size import probe_source_size
+from .sponsorblock import skip_for_video, skip_video
 from .video import AIConclusion
 
 
@@ -334,22 +335,30 @@ class BilibiliParser(BaseParser):
             cache_key += f":audio:{audio_stream.audio_quality.value}"
         retryable_http_statuses = self.BILI_RETRYABLE_HTTP_STATUSES
 
+        # 空降：标注查一次就够了，裁掉的秒数当场从时长里扣掉给卡片用
+        cuts, mutes, removed = await skip_for_video(bvid, cid, duration)
+        duration -= removed
+
         class BiliVideoDownloader:
             def __init__(
                 self,
                 video_urls: tuple[str, ...],
                 audio_urls: tuple[str, ...] | None,
                 ext_headers: dict[str, str] | None,
+                cuts: tuple[tuple[float, float], ...],
+                mutes: tuple[tuple[float, float], ...],
             ):
                 self.url = video_urls[0]
                 self.video_urls = video_urls
                 self.audio_urls = audio_urls
                 self.ext_headers = ext_headers
+                self.cuts = cuts
+                self.mutes = mutes
 
             async def __call__(self) -> Path:
                 # 有单独音频流时，走 av 合并
                 if self.audio_urls:
-                    return await DOWNLOADER.download_av_and_merge(
+                    source_path = await DOWNLOADER.download_av_and_merge(
                         video_url=self.url,
                         audio_url=self.audio_urls[0],
                         video_fallback_urls=self.video_urls[1:],
@@ -358,17 +367,21 @@ class BilibiliParser(BaseParser):
                         cache_key=cache_key,
                         ext_headers=self.ext_headers,
                     )
-                # 否则直接用流式下载
-                return await DOWNLOADER.download_video(
-                    url=self.url,
-                    fallback_urls=self.video_urls[1:],
-                    retry_http_statuses=retryable_http_statuses,
-                    cache_key=cache_key,
-                    cache_variant="source",
-                    ext_headers=self.ext_headers,
-                )
+                else:
+                    # 否则直接用流式下载
+                    source_path = await DOWNLOADER.download_video(
+                        url=self.url,
+                        fallback_urls=self.video_urls[1:],
+                        retry_http_statuses=retryable_http_statuses,
+                        cache_key=cache_key,
+                        cache_variant="source",
+                        ext_headers=self.ext_headers,
+                    )
+                return await skip_video(source_path, self.cuts, self.mutes)
 
-        downloader = BiliVideoDownloader(video_urls, audio_urls, self.headers)
+        downloader = BiliVideoDownloader(
+            video_urls, audio_urls, self.headers, cuts, mutes
+        )
 
         video_content = self.create_video(
             url_or_task=downloader,
@@ -376,9 +389,6 @@ class BilibiliParser(BaseParser):
             duration=duration,
             ext_headers=self.headers,
             cache_key=cache_key,
-            origin_ids={"bvid": bvid, "page": str(page_index + 1), "cid": str(cid)}
-            if cid is not None
-            else {"bvid": bvid, "page": str(page_index + 1)},
         )
 
         async def probe_head_size(url: str) -> int | None:

@@ -51,30 +51,26 @@ HTTP 400 拒绝**整个请求**（实测返回 ``["Unknown category provided."]`
 def parse_media_speedup_rules(
     value: list[str],
 ) -> dict[tuple[PlatformEnum, str], float]:
-    """把 ``["bilibili:123456=1.25"]`` 解析成 ``{(平台, 作者 id): 倍速}``
+    """把 ``["bilibili:123456:1.25"]`` 解析成 ``{(平台, 作者 id): 倍速}``
 
-    作者 id 就是 ``ParseResult.author.id``，项目内已统一这个字段，不再兼容别的
-    写法；同一个作者重复配置时不做冲突检测，后者覆盖前者，配置由使用者负责。
-    倍速也不设上下限，笔误最多是让转码慢一点。
+    作者 id 就是 ``ParseResult.author.id``；同一作者重复配置时后者覆盖前者，
+    倍速也不设上下限，配置由使用者负责。
     """
     rules: dict[tuple[PlatformEnum, str], float] = {}
     for raw in value:
-        text = raw.strip()
-        if not text:
-            continue
-        left, equal, ratio_text = text.partition("=")
-        platform_name, colon, author_id = left.partition(":")
-        if not (equal and colon and author_id):
-            raise ValueError(f"变速规则应为 平台:作者id=倍速，收到: {raw!r}")
+        parts = [part.strip() for part in raw.split(":")]
+        if len(parts) != 3 or not (parts[1] and parts[2]):
+            raise ValueError(f"变速规则应为 平台:作者id:倍速，收到: {raw!r}")
+        platform_name, author_id, ratio_text = parts
         try:
-            platform = PlatformEnum(platform_name.strip())
+            platform = PlatformEnum(platform_name)
         except ValueError:
             raise ValueError(f"变速规则里的平台不存在: {platform_name!r}") from None
         try:
             ratio = float(ratio_text)
         except ValueError:
             raise ValueError(f"变速规则的倍速不是数字，收到: {raw!r}") from None
-        rules[(platform, author_id.strip())] = ratio
+        rules[(platform, author_id)] = ratio
     return rules
 
 
@@ -153,13 +149,13 @@ class Config(BaseModel):
     plite_render_format: Literal["jpeg", "webp"] = "webp"
     """渲染图片格式，jpeg会丢失透明度但可能兼容性更好"""
     plite_media_speedup_rules: list[str] = []
-    """上传前按「平台+作者」对视频和音频做倍速，格式 平台:作者id=倍速，
-    如 ["bilibili:123456=1.25"]；作者 id 即解析结果的 author.id。
-    命中即重新编码，产物为有损，需 ffmpeg；裁切与消音只作用于视频"""
+    """上传前按「平台+作者」对视频和音频做倍速，格式 平台:作者id:倍速，
+    如 ["bilibili:123456:1.25"]；作者 id 即解析结果的 author.id。
+    命中即重新编码，产物为有损，需 ffmpeg"""
     plite_media_transcode_concurrency: int = 1
     """上传前预处理允许的同时转码数，与卡片渲染的并发限制互相独立；修改后需重启生效"""
     plite_sponsorblock_api_base: str | None = None
-    """SponsorBlock 兼容服务的基地址，留空表示不启用、不外发任何请求。
+    """哔哩哔哩空降用的 SponsorBlock 兼容服务基地址，留空表示不启用、不外发任何请求。
     上游项目的官方服务是 ``https://www.bsbsb.top``（镜像 ``https://www.bsbsb.xyz``），
     由 B站去广告插件项目自行运营；填在这里就等于你信任它返回的时间区间"""
     plite_sponsorblock_categories: list[str] = []
