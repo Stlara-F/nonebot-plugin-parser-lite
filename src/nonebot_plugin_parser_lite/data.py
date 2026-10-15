@@ -21,6 +21,77 @@ def repr_path_task(path_task: DownloadTaskWrapper[Path]) -> str:
     return f"url={path_task.url!r}"
 
 
+def _fmt_seconds(value: float) -> str:
+    """把秒数格式化成稳定、可比较的短字符串，用于缓存签名"""
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _ranges_length(ranges: tuple[tuple[float, float], ...]) -> float:
+    return sum(max(0.0, end - start) for start, end in ranges)
+
+
+def _format_hms(duration: float) -> str:
+    """把秒数格式化为 m:ss 或 h:mm:ss"""
+    try:
+        total_seconds = int(duration)
+        if total_seconds <= 0:
+            return "0:00"
+
+        minutes, seconds = divmod(total_seconds, 60)
+        if minutes < 60:
+            return f"{minutes}:{seconds:02d}"
+
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    except (TypeError, ValueError):
+        return "NaN"
+
+
+@dataclass(frozen=True, slots=True)
+class VideoEditPlan:
+    """上传前对视频时间轴的一次编辑意图。
+
+    区间一律使用源视频时间轴（秒），由构造方负责排序、裁剪与合并；
+    产物时长统一通过 `output_duration` 换算，渲染侧也读同一个来源，
+    避免出现卡片时长与实际文件不一致。
+    """
+
+    speed_ratio: float = 1.0
+    """播放倍率，1.0 表示不变速"""
+    cut_ranges: tuple[tuple[float, float], ...] = ()
+    """需要删除的源时间轴区间"""
+    mute_ranges: tuple[tuple[float, float], ...] = ()
+    """需要消音的源时间轴区间，不改变时间轴"""
+
+    @property
+    def is_noop(self) -> bool:
+        return (
+            self.speed_ratio == 1.0
+            and not self.cut_ranges
+            and not self.mute_ranges
+        )
+
+    @property
+    def removed_duration(self) -> float:
+        """被删除的总时长，消音区间不参与"""
+        return _ranges_length(self.cut_ranges)
+
+    def output_duration(self, source_duration: float) -> float:
+        """源时长换算为产物时长：先裁掉区间，再整体变速"""
+        remaining = max(0.0, source_duration - self.removed_duration)
+        return remaining / self.speed_ratio
+
+    def signature(self) -> str:
+        """参与产物文件名的指纹；任何影响输出的输入都要进这里"""
+        cuts = ",".join(
+            f"{_fmt_seconds(start)}-{_fmt_seconds(end)}" for start, end in self.cut_ranges
+        )
+        mutes = ",".join(
+            f"{_fmt_seconds(start)}-{_fmt_seconds(end)}" for start, end in self.mute_ranges
+        )
+        return f"r{_fmt_seconds(self.speed_ratio)}|c[{cuts}]|m[{mutes}]"
+
+
 @dataclass(repr=False, slots=True)
 class MediaContent:
     path_task: DownloadTaskWrapper[Path]
@@ -31,6 +102,8 @@ class MediaContent:
     _size_bytes: int | None = field(default=None, init=False, repr=False)
     is_dynamic_size: bool = field(default=False, init=False)
     """流媒体在下载完成前无法确定文件大小"""
+    origin_ids: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    """平台侧的稳定标识（如 bvid / cid），供上传前预处理查表使用，不进渲染数据"""
 
     async def get_path(self) -> Path:
         """
@@ -94,19 +167,7 @@ class AudioContent(MediaContent):
 
     @property
     def display_duration(self) -> str:
-        try:
-            total_seconds = int(self.duration)
-            if total_seconds <= 0:
-                return "0:00"
-
-            minutes, seconds = divmod(total_seconds, 60)
-            if minutes < 60:
-                return f"{minutes}:{seconds:02d}"
-
-            hours, minutes = divmod(minutes, 60)
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        except (TypeError, ValueError):
-            return "NaN"
+        return _format_hms(self.duration)
 
 
 @dataclass(repr=False, slots=True)
@@ -117,25 +178,29 @@ class VideoContent(MediaContent):
     """视频封面"""
     duration: float = 0.0
     """时长 单位: 秒"""
+    edit_plan: VideoEditPlan | None = field(default=None, init=False, repr=False)
+    """上传前预处理计划；渲染层据此换算展示时长，不就地改写 duration"""
 
     async def get_cover_path(self) -> Path | None:
         return None if self.cover is None else await self.cover
 
     @property
+    def effective_duration(self) -> float:
+        """有编辑计划时返回产物时长，否则返回源时长"""
+        if self.edit_plan is not None and not self.edit_plan.is_noop:
+            return self.edit_plan.output_duration(self.duration)
+        return self.duration
+
+    @property
     def display_duration(self) -> str:
-        try:
-            total_seconds = int(self.duration)
-            if total_seconds <= 0:
-                return "0:00"
+        return _format_hms(self.effective_duration)
 
-            minutes, seconds = divmod(total_seconds, 60)
-            if minutes < 60:
-                return f"{minutes}:{seconds:02d}"
-
-            hours, minutes = divmod(minutes, 60)
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        except (TypeError, ValueError):
-            return "NaN"
+    async def get_display_size(self) -> str:
+        """变速/裁切后的体积要到转码结束才可知，避免显示源文件体积误导"""
+        if self.edit_plan is not None and not self.edit_plan.is_noop:
+            return "处理后变化"
+        # slots dataclass 会重建类，零参 super() 在这里会指向旧类，因此显式指定基类
+        return await MediaContent.get_display_size(self)
 
 
 @dataclass(repr=False, slots=True)

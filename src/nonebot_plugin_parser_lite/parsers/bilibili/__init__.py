@@ -295,12 +295,14 @@ class BilibiliParser(BaseParser):
         duration = arc.duration
         timestamp = arc.pubdate
         cover = arc.pic or None
+        cid: int | None = video_info.pages[0].page.cid if video_info.pages else None
         if len(video_info.pages) > 1:
             page_index %= len(video_info.pages)
             page = video_info.pages[page_index].page
             title = f"{title} | 分集 - {page.part}"
             duration = page.duration
             cover = page.first_frame or cover
+            cid = page.cid
         elif video_info.pages:
             page_index = 0
 
@@ -374,6 +376,9 @@ class BilibiliParser(BaseParser):
             duration=duration,
             ext_headers=self.headers,
             cache_key=cache_key,
+            origin_ids={"bvid": bvid, "page": str(page_index + 1), "cid": str(cid)}
+            if cid is not None
+            else {"bvid": bvid, "page": str(page_index + 1)},
         )
 
         async def probe_head_size(url: str) -> int | None:

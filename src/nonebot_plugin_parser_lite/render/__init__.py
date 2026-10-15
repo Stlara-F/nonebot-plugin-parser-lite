@@ -34,6 +34,7 @@ from ..exception import (
     SizeLimitException,
 )
 from ..helper import ForwardNodeInner, UniHelper, UniMessage, mark_media_role
+from ..preprocess import apply_edit_plan
 from ..utils.cache import CacheManager
 from ..utils.ffmpeg import FFmpeg
 from .context import PLACEHOLDER_IMAGE, ThemeData, build_theme_data, safe_src
@@ -407,8 +408,13 @@ class Renderer:
     async def __build_video_seg(
         cont: VideoContent, path: Path | None = None
     ) -> ForwardNodeInner:
-        """构建视频或视频文件消息段"""
+        """构建视频或视频文件消息段
+
+        即时发送与合并转发两条链路都收口在这里，所以上传前预处理只需在此应用一次；
+        计划缺失或转码失败时退回原始文件。
+        """
         video_path = path or await cont.get_path()
+        video_path = await apply_edit_plan(cont, video_path)
         if pconfig.need_upload_video:
             segment = await UniHelper.file_seg(video_path)
             mark_media_role(segment, "video")
