@@ -11,12 +11,44 @@ from uuid import uuid4
 from anyio import Path
 from nonebot import logger
 
+from ..config import pconfig
+from ..constants import MIN_KEEP_PIECE_SECONDS
 from ..exception import SizeLimitException
 from .cache import CacheManager
 from .common import fmt_size
 
-MIN_PIECE_SECONDS = 0.05
-"""裁切后保留片段的最小时长，过短的碎片会让 concat 滤镜图失去意义"""
+AUDIO_CODECS: dict[str, tuple[str, ...]] = {
+    ".mp3": ("-c:a", "libmp3lame", "-q:a", "2"),
+    ".m4a": ("-c:a", "aac", "-b:a", "192k"),
+    ".mp4": ("-c:a", "aac", "-b:a", "192k"),
+    ".m4s": ("-c:a", "aac", "-b:a", "192k"),
+    ".mov": ("-c:a", "aac", "-b:a", "192k"),
+    ".aac": ("-c:a", "aac", "-b:a", "192k"),
+    ".wav": ("-c:a", "pcm_s16le"),
+    ".ogg": ("-c:a", "libvorbis"),
+    ".opus": ("-c:a", "libopus"),
+    ".flac": ("-c:a", "flac"),
+}
+"""音频重编码参数，按扩展名选；变速必须重编码，容器沿用源文件"""
+
+MP4_LIKE_SUFFIXES = {".mp4", ".m4a", ".m4s", ".mov"}
+
+_gate_loop: asyncio.AbstractEventLoop | None = None
+_gate: asyncio.Semaphore | None = None
+
+
+def transcode_gate() -> asyncio.Semaphore:
+    """同时转码的闸门
+
+    信号量按当前事件循环创建，模块级对象会绑死在第一个循环上（render/context.py
+    里是同样的顾虑）。
+    """
+    global _gate_loop, _gate
+    loop = asyncio.get_running_loop()
+    if _gate is None or _gate_loop is not loop:
+        _gate_loop = loop
+        _gate = asyncio.Semaphore(pconfig.media_transcode_concurrency)
+    return _gate
 
 
 def _pad(target: str) -> str:
@@ -682,7 +714,7 @@ class FFmpeg:
         return [
             (start, end)
             for start, end in pieces
-            if end - start > MIN_PIECE_SECONDS
+            if end - start > MIN_KEEP_PIECE_SECONDS
         ]
 
     @classmethod
@@ -697,6 +729,22 @@ class FFmpeg:
         return "+".join(terms)
 
     @classmethod
+    def _build_tempo_chain(cls, ratio: float) -> str:
+        """把倍率拆成若干级 atempo：单级只保证 0.5~2.0，老版本超出就直接拒"""
+        if ratio <= 0:
+            raise RuntimeError(f"非法的倍率: {ratio}")
+        stages: list[float] = []
+        remaining = ratio
+        while remaining > 2.0:
+            stages.append(2.0)
+            remaining /= 2.0
+        while remaining < 0.5:
+            stages.append(0.5)
+            remaining /= 0.5
+        stages.append(remaining)
+        return ",".join(f"atempo={cls._format_filter_number(stage)}" for stage in stages)
+
+    @classmethod
     def _build_timeline_filter(
         cls,
         pieces: list[tuple[float, float]],
@@ -707,7 +755,7 @@ class FFmpeg:
         """裁切并拼接保留区间
 
         消音表达式在 split 之前作用于原始时间轴，因此消音区间不需要随裁切
-        重新映射。
+        重新映射。音频只取第一条流，多轨产物在 IM 侧基本只有第一条会被播。
 
         :return: (滤镜片段, 视频输出标签, 音频输出标签)
         """
@@ -721,7 +769,7 @@ class FFmpeg:
             parts.append(f"[0:v]split={count}{labels}")
 
         audio_source = "0:a"
-        if mute_ranges:
+        if has_audio and mute_ranges:
             enable = cls._build_mute_expression(mute_ranges)
             parts.append(f"[0:a]volume=enable='{enable}':volume=0[am]")
             audio_source = "am"
@@ -768,8 +816,8 @@ class FFmpeg:
     ) -> Path:
         """按编辑计划重编码视频，一次 ffmpeg 调用产出终态文件
 
-        变速与裁切合并在同一条滤镜链里完成，避免两代有损编码；只消音时视频
-        流直接复制，不额外损失画质。产物名由调用方编入计划指纹，命中即复用。
+        变速与裁切合并在同一条滤镜链里，避免两代有损编码；只消音时视频流直接
+        复制。产物名由调用方给出，命中缓存即复用。
 
         :param input_path: 源视频路径
         :param file_name: 输出文件名（不含扩展名）
@@ -798,8 +846,7 @@ class FFmpeg:
         )
         if not pieces:
             raise RuntimeError("裁切后没有剩余片段")
-        # 只要发生过裁切就得走 trim 滤镜；裁掉开头或结尾时只剩一个片段，
-        # 但仍然需要裁剪，不能拿「片段数量 > 1」当作判据
+        # 裁掉开头或结尾时只剩一个片段，但仍然要裁，不能拿「片段数 > 1」当判据
         needs_trim = bool(cut_ranges)
 
         filter_parts: list[str] = []
@@ -817,11 +864,14 @@ class FFmpeg:
 
         video_filtered = needs_trim or speed_ratio != 1.0
         if speed_ratio != 1.0:
-            ratio = cls._format_filter_number(speed_ratio)
-            filter_parts.append(f"{_pad(video_target)}setpts=PTS/{ratio}[vf]")
+            filter_parts.append(
+                f"{_pad(video_target)}setpts=PTS/"
+                f"{cls._format_filter_number(speed_ratio)}[vf]"
+            )
             video_target = "[vf]"
             if audio_target is not None:
-                filter_parts.append(f"{_pad(audio_target)}atempo={ratio}[af]")
+                tempo = cls._build_tempo_chain(speed_ratio)
+                filter_parts.append(f"{_pad(audio_target)}{tempo}[af]")
                 audio_target = "[af]"
 
         cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
@@ -863,6 +913,54 @@ class FFmpeg:
             await temp_path.unlink(missing_ok=True)
         logger.success(
             f"Edited video {output_path.name}, size={await fmt_size(output_path)}"
+        )
+        return output_path
+
+    @classmethod
+    async def edit_audio(
+        cls,
+        input_path: Path,
+        file_name: str,
+        *,
+        speed_ratio: float,
+        max_size_mb: int = 90,
+    ) -> Path:
+        """按倍率重编码音频，产物沿用源文件的容器
+
+        音频只处理倍速，裁切与消音是画面时间轴上的概念；``-vn`` 会连内嵌封面
+        一起去掉，语音/文件消息用不到它。
+
+        :param input_path: 源音频路径
+        :param file_name: 输出文件名（不含扩展名），扩展名沿用源文件
+        :param speed_ratio: 播放倍率
+        :param max_size_mb: 产物体积上限，超限时中止并抛 SizeLimitException
+
+        :return: 产物路径
+        """
+        cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
+        suffix = input_path.suffix.lower() or ".m4a"
+        output_path = cache_dir / f"{file_name}{suffix}"
+        if await output_path.exists():
+            return output_path
+
+        tempo = cls._build_tempo_chain(speed_ratio)
+        cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
+        cmd += ["-i", str(input_path), "-vn", "-af", tempo]
+        cmd += list(AUDIO_CODECS.get(suffix, ("-c:a", "aac", "-b:a", "192k")))
+        if suffix in MP4_LIKE_SUFFIXES:
+            cmd += ["-movflags", "+faststart"]
+        logger.info(f"Editing audio '{input_path.name}' as '{output_path.name}'")
+        temp_path = cls.temporary_output_path(output_path)
+        cmd += [str(temp_path)]
+        try:
+            await cls.exec_ffmpeg_monitored(
+                cmd, output_path=temp_path, max_size_mb=max_size_mb
+            )
+            await temp_path.replace(output_path)
+        finally:
+            await temp_path.unlink(missing_ok=True)
+        logger.success(
+            f"Edited audio {output_path.name}, size={await fmt_size(output_path)}"
         )
         return output_path
 

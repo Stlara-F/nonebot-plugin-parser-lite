@@ -1,68 +1,81 @@
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
+
+from anyio import Path as AnyPath
 import pytest
-import render_test_support as support
 from render_test_support import ResolvedPathTask
 
-from nonebot_plugin_parser_lite.data import VideoContent, VideoEditPlan
+from nonebot_plugin_parser_lite.data import AudioContent, MediaEditPlan, VideoContent
 
 
-def make_video(duration: float = 600.0) -> VideoContent:
-    return VideoContent(
-        path_task=ResolvedPathTask(support.SyncPath("video.mp4")),  # type: ignore[arg-type]
-        duration=duration,
-    )
+def make_video(tmp_path: Path, plan: MediaEditPlan | None = None) -> VideoContent:
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"x" * 2048)
+    cont = VideoContent(path_task=ResolvedPathTask(source), duration=120.0)
+    cont.edit_plan = plan
+    return cont
 
 
-def test_cut_and_speed_compose_into_one_output_duration():
-    plan = VideoEditPlan(speed_ratio=1.5, cut_ranges=((0.0, 60.0), (120.0, 180.0)))
+def test_output_duration_composes_cut_and_speed():
+    plan = MediaEditPlan(speed_ratio=1.5, cut_ranges=((0.0, 60.0), (120.0, 180.0)))
     assert plan.removed_duration == pytest.approx(120.0)
     assert plan.output_duration(600.0) == pytest.approx(320.0)
+    assert plan.output_duration(60.0) == 0.0
 
 
-def test_mute_does_not_shorten_the_timeline():
-    plan = VideoEditPlan(mute_ranges=((10.0, 25.0),))
+def test_mute_keeps_the_timeline_but_is_not_a_noop():
+    plan = MediaEditPlan(mute_ranges=((10.0, 25.0),))
     assert plan.output_duration(600.0) == pytest.approx(600.0)
     assert not plan.is_noop
+    assert MediaEditPlan().is_noop
 
 
-def test_default_plan_is_noop():
-    assert VideoEditPlan().is_noop
+@pytest.mark.parametrize("cls", [VideoContent, AudioContent])
+def test_display_duration_follows_the_plan_without_mutating_source(
+    cls, tmp_path: Path
+):
+    source = tmp_path / "media.mp4"
+    source.write_bytes(b"x")
+    cont = cls(path_task=ResolvedPathTask(source), duration=120.0)
+    assert cont.display_duration == "2:00"
+
+    cont.edit_plan = MediaEditPlan(speed_ratio=2.0)
+    assert cont.display_duration == "1:00"
+    assert cont.duration == 120.0, "时长要由计划换算，不能就地改写"
+    # 同一个缓存结果反复渲染时，倍速不能被叠加两次
+    assert cont.display_duration == "1:00"
 
 
-def test_output_duration_never_goes_negative():
-    plan = VideoEditPlan(cut_ranges=((0.0, 900.0),))
-    assert plan.output_duration(600.0) == pytest.approx(0.0)
+@pytest.mark.parametrize("cls", [VideoContent, AudioContent])
+def test_display_size_is_an_estimate_when_planned(cls, tmp_path: Path):
+    source = tmp_path / "media.mp4"
+    source.write_bytes(b"x" * 2048)
+    cont = cls(path_task=ResolvedPathTask(source), duration=120.0)
+    cont._size_bytes = 2048
+
+    assert asyncio.run(cont.get_display_size()) == "2.00KB"
+    cont.edit_plan = MediaEditPlan(speed_ratio=2.0)
+    assert asyncio.run(cont.get_display_size()) == "~1.00KB"
 
 
-def test_display_duration_follows_the_plan_without_mutating_source():
-    cont = make_video(600.0)
-    assert cont.display_duration == "10:00"
-
-    cont.edit_plan = VideoEditPlan(speed_ratio=1.25)
-    assert cont.duration == 600.0
-    assert cont.display_duration == "8:00"
-
-    # 同一个缓存结果被反复渲染时，倍速不能被叠加两次
-    assert cont.display_duration == "8:00"
+def test_digest_separates_every_plan_input():
+    plan = MediaEditPlan(1.25, ((5.0, 10.0),))
+    assert plan.digest() == MediaEditPlan(1.25, ((5.0, 10.0),)).digest()
+    assert plan.digest() != MediaEditPlan(1.5, ((5.0, 10.0),)).digest()
+    assert plan.digest() != MediaEditPlan(1.25, ((5.0, 10.0000001),)).digest()
+    assert plan.digest() != MediaEditPlan(1.25, ((5.0, 10.0),), ((1.0, 2.0),)).digest()
 
 
-@pytest.mark.asyncio
-async def test_display_size_is_marked_pending_only_for_real_edits():
-    cont = make_video()
-    cont.edit_plan = VideoEditPlan(speed_ratio=1.5)
-    assert await cont.get_display_size() == "处理后变化"
+def test_cache_name_is_readable_and_path_sensitive(tmp_path: Path):
+    plan = MediaEditPlan(1.25, ((5.0, 10.0),))
+    name = plan.cache_name(AnyPath(str(tmp_path / "source.mp4")))
+    assert name.startswith("source-1.25x-cliped-")
+    assert ":" not in name, "Windows 的文件名不允许冒号"
 
-    cont.edit_plan = VideoEditPlan()
-    assert await cont.get_display_size() != "处理后变化"
+    muted = MediaEditPlan(1.0, (), ((5.0, 10.0),))
+    assert "-1.00x-no_clip_mute-" in muted.cache_name(AnyPath(str(tmp_path / "s.mp3")))
 
-
-def test_signature_separates_ratio_and_every_range_set():
-    base = VideoEditPlan(speed_ratio=1.25, cut_ranges=((5.0, 10.0),))
-    assert base.signature() == VideoEditPlan(1.25, ((5.0, 10.0),)).signature()
-    assert base.signature() != VideoEditPlan(1.5, ((5.0, 10.0),)).signature()
-    assert base.signature() != VideoEditPlan(1.25, ((5.0, 12.0),)).signature()
-    assert base.signature() != VideoEditPlan(
-        1.25, ((5.0, 10.0),), ((1.0, 2.0),)
-    ).signature()
-    assert base.signature() != VideoEditPlan(1.25).signature()
+    elsewhere = plan.cache_name(AnyPath(str(Path("other") / "source.mp4")))
+    assert name != elsewhere, "主干相同、目录不同的源不能命中同一个产物"

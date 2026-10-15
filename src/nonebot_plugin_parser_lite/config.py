@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Literal
 
 from anyio import Path
@@ -28,116 +27,55 @@ def parse_hm_to_minutes(value: str) -> int:
     return hour * 60 + minute
 
 
-SPEEDUP_RATIO_MIN = 0.5
-"""倍速下限，与 ffmpeg atempo 的最小可用值一致"""
-SPEEDUP_RATIO_MAX = 4.0
-"""倍速上限，避免一条笔误的规则把部署者拖进长时间重编码"""
-_AUTHOR_ID_ALIASES = frozenset({"author", "mid", "uid", "id", "user_id", "userid"})
-"""作者维度规则里表示「作者 id」的等价写法"""
 SPONSORBLOCK_CATEGORIES = frozenset(
     {
         "sponsor",
+        "selfpromo",
+        "exclusive_access",
+        "interaction",
+        "poi_highlight",
         "intro",
         "outro",
-        "interaction",
-        "selfpromotion",
-        "musiconly",
         "preview",
-        "poihighlight",
+        "padding",
         "filler",
-        "exclusiveaccess",
-        "chapter",
+        "music_offtopic",
     }
 )
-"""SponsorBlock 已知的片段分类；是否真的裁掉还取决于服务返回的 actionType"""
-
-
-@dataclass(frozen=True, slots=True)
-class MediaSpeedupRule:
-    """解析后的单条上传前变速规则"""
-
-    platform: PlatformEnum
-    """平台"""
-    author_id: str
-    """作者 id，匹配 ParseResult.author.id"""
-    ratio: float
-    """倍速"""
-
-    @property
-    def key(self) -> tuple[PlatformEnum, str]:
-        return (self.platform, self.author_id)
-
-
-def parse_media_speedup_rule(raw: str) -> MediaSpeedupRule:
-    """把 `bilibili:mid:123456=1.25` 解析为规则对象
-
-    中段是作者 id 的等价写法（`author` / `mid` / `uid` / `id` / `user_id` /
-    `userid`），插件统一按 `ParseResult.author.id` 匹配，不区分平台的命名习惯。
-    """
-    text = raw.strip()
-    if "=" not in text:
-        raise ValueError(f"变速规则缺少 '='，应为 平台:作者标识:id=倍速，收到: {raw!r}")
-    left, _, ratio_text = text.partition("=")
-    parts = left.split(":")
-    if len(parts) != 3:
-        raise ValueError(
-            f"变速规则应为 平台:作者标识:id=倍速 三段，收到: {raw!r}"
-        )
-    platform_name, id_kind, author_id = (part.strip() for part in parts)
-    if id_kind not in _AUTHOR_ID_ALIASES:
-        raise ValueError(
-            f"未知的作者标识写法 {id_kind!r}，可用: "
-            f"{', '.join(sorted(_AUTHOR_ID_ALIASES))}；收到: {raw!r}"
-        )
-    if not author_id:
-        raise ValueError(f"变速规则的作者 id 为空，收到: {raw!r}")
-    try:
-        platform = PlatformEnum(platform_name)
-    except ValueError:
-        raise ValueError(f"变速规则里的平台不存在: {platform_name!r}") from None
-    try:
-        ratio = float(ratio_text.strip())
-    except ValueError:
-        raise ValueError(f"变速规则的倍速不是数字，收到: {raw!r}") from None
-    if not (SPEEDUP_RATIO_MIN <= ratio <= SPEEDUP_RATIO_MAX):
-        raise ValueError(
-            f"倍速需在 {SPEEDUP_RATIO_MIN}~{SPEEDUP_RATIO_MAX} 之间，收到: {raw!r}"
-        )
-    return MediaSpeedupRule(platform=platform, author_id=author_id, ratio=ratio)
+"""BilibiliSponsorBlock 接受的片段分类，必须与服务端一致：传入未知分类时服务会用
+HTTP 400 拒绝**整个请求**（实测返回 ``["Unknown category provided."]``），而不是
+只忽略那一项，所以在配置阶段就拦住笔误。能不能真裁掉还取决于返回的 actionType
+（``exclusive_access`` 只带 ``full``、``poi_highlight`` 只带 ``poi``，都不裁切）。"""
 
 
 def parse_media_speedup_rules(
     value: list[str],
-) -> tuple[MediaSpeedupRule, ...]:
-    """解析并校验整张规则表，同一平台+作者只允许一条规则"""
-    parsed: dict[tuple[PlatformEnum, str], MediaSpeedupRule] = {}
+) -> dict[tuple[PlatformEnum, str], float]:
+    """把 ``["bilibili:123456=1.25"]`` 解析成 ``{(平台, 作者 id): 倍速}``
+
+    作者 id 就是 ``ParseResult.author.id``，项目内已统一这个字段，不再兼容别的
+    写法；同一个作者重复配置时不做冲突检测，后者覆盖前者，配置由使用者负责。
+    倍速也不设上下限，笔误最多是让转码慢一点。
+    """
+    rules: dict[tuple[PlatformEnum, str], float] = {}
     for raw in value:
-        rule = parse_media_speedup_rule(raw)
-        previous = parsed.get(rule.key)
-        if previous is not None and previous.ratio != rule.ratio:
-            raise ValueError(
-                f"同一作者配置了互相矛盾的倍速: "
-                f"{rule.platform} / {rule.author_id} = "
-                f"{previous.ratio} 与 {rule.ratio}"
-            )
-        parsed[rule.key] = rule
-    return tuple(parsed.values())
-
-
-_SPEEDUP_RULES_MEMO: dict[tuple[str, ...], tuple[MediaSpeedupRule, ...]] = {}
-
-
-def _speedup_rules_for(
-    raw: tuple[str, ...],
-) -> tuple[MediaSpeedupRule, ...]:
-    """按原始配置串缓存解析结果；字段校验已保证这里不会抛错"""
-    cached = _SPEEDUP_RULES_MEMO.get(raw)
-    if cached is None:
-        if len(_SPEEDUP_RULES_MEMO) > 32:
-            _SPEEDUP_RULES_MEMO.clear()
-        cached = parse_media_speedup_rules(list(raw))
-        _SPEEDUP_RULES_MEMO[raw] = cached
-    return cached
+        text = raw.strip()
+        if not text:
+            continue
+        left, equal, ratio_text = text.partition("=")
+        platform_name, colon, author_id = left.partition(":")
+        if not (equal and colon and author_id):
+            raise ValueError(f"变速规则应为 平台:作者id=倍速，收到: {raw!r}")
+        try:
+            platform = PlatformEnum(platform_name.strip())
+        except ValueError:
+            raise ValueError(f"变速规则里的平台不存在: {platform_name!r}") from None
+        try:
+            ratio = float(ratio_text)
+        except ValueError:
+            raise ValueError(f"变速规则的倍速不是数字，收到: {raw!r}") from None
+        rules[(platform, author_id.strip())] = ratio
+    return rules
 
 
 class Config(BaseModel):
@@ -215,19 +153,21 @@ class Config(BaseModel):
     plite_render_format: Literal["jpeg", "webp"] = "webp"
     """渲染图片格式，jpeg会丢失透明度但可能兼容性更好"""
     plite_media_speedup_rules: list[str] = []
-    """上传前按「平台+作者」对视频做倍速，格式 平台:作者标识:id=倍速（0.5~4.0），
-    如 ["bilibili:mid:123456=1.25"]；作者标识 author/mid/uid/id/user_id 等价，
-    统一匹配解析结果的作者 id。命中即重新编码，产物为有损，需 ffmpeg"""
+    """上传前按「平台+作者」对视频和音频做倍速，格式 平台:作者id=倍速，
+    如 ["bilibili:123456=1.25"]；作者 id 即解析结果的 author.id。
+    命中即重新编码，产物为有损，需 ffmpeg；裁切与消音只作用于视频"""
     plite_media_transcode_concurrency: int = 1
     """上传前预处理允许的同时转码数，与卡片渲染的并发限制互相独立；修改后需重启生效"""
     plite_sponsorblock_api_base: str | None = None
-    """SponsorBlock 兼容服务的基地址，留空表示不启用、不外发任何请求；
-    插件不替你决定要信任哪个第三方实例，请填写自建或你认可的服务地址"""
+    """SponsorBlock 兼容服务的基地址，留空表示不启用、不外发任何请求。
+    上游项目的官方服务是 ``https://www.bsbsb.top``（镜像 ``https://www.bsbsb.xyz``），
+    由 B站去广告插件项目自行运营；填在这里就等于你信任它返回的时间区间"""
     plite_sponsorblock_categories: list[str] = []
     """参与裁切的片段分类白名单，配置了服务地址时必填；
-    可选 sponsor/intro/outro/interaction/selfpromotion/musiconly/preview/
-    poihighlight/filler/exclusiveaccess/chapter，
-    实际是否裁掉还取决于服务返回的 actionType（skip 删除区间，mute 只消音）"""
+    可选 sponsor/selfpromo/exclusive_access/interaction/poi_highlight/intro/
+    outro/preview/padding/filler/music_offtopic（须与服务端一致，未知分类会让
+    整个请求返回 400）。实际是否裁掉还取决于服务返回的 actionType
+    （skip 删除区间，mute 只消音，full/poi 不处理）"""
 
     @field_validator("plite_download_command")
     @classmethod
@@ -249,16 +189,18 @@ class Config(BaseModel):
     @field_validator("plite_media_speedup_rules")
     @classmethod
     def validate_media_speedup_rules(cls, value: list[str]) -> list[str]:
-        rules = list(dict.fromkeys(item.strip() for item in value if item.strip()))
-        parse_media_speedup_rules(rules)
-        return rules
+        # 启动时就解析一遍，笔误不至于等到发消息才静默不生效
+        parse_media_speedup_rules(value)
+        return [item.strip() for item in value if item.strip()]
 
     @field_validator("plite_sponsorblock_categories")
     @classmethod
     def validate_sponsorblock_categories(cls, value: list[str]) -> list[str]:
-        categories = list(dict.fromkeys(item.strip().casefold() for item in value))
-        if not all(categories):
-            raise ValueError("片段分类不能为空字符串")
+        categories = list(
+            dict.fromkeys(
+                item for item in (entry.strip().casefold() for entry in value) if item
+            )
+        )
         unknown = [item for item in categories if item not in SPONSORBLOCK_CATEGORIES]
         if unknown:
             raise ValueError(
@@ -274,21 +216,10 @@ class Config(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def validate_media_preprocess(self) -> "Config":
-        if self.plite_media_transcode_concurrency < 1:
-            raise ValueError("转码并发数至少为 1")
-        if self.plite_sponsorblock_api_base is not None:
-            base = self.plite_sponsorblock_api_base.strip()
-            if not base:
-                raise ValueError("SponsorBlock 服务地址不能是空字符串，留空表示不启用")
-            if not base.startswith(("http://", "https://")):
-                raise ValueError("SponsorBlock 服务地址必须以 http:// 或 https:// 开头")
-            if not self.plite_sponsorblock_categories:
-                raise ValueError(
-                    "配置了 SponsorBlock 服务地址时必须同时指定至少一个片段分类"
-                )
-        elif self.plite_sponsorblock_categories:
-            raise ValueError("指定片段分类时必须同时配置 SponsorBlock 服务地址")
+    def validate_sponsorblock_api_base(self) -> "Config":
+        base = self.plite_sponsorblock_api_base
+        if base is not None and not base.startswith("http"):
+            raise ValueError("SponsorBlock 服务地址需以 http 开头")
         return self
 
     @property
@@ -479,22 +410,19 @@ class Config(BaseModel):
         return self.plite_render_format
 
     @property
-    def media_speedup_rules(self) -> tuple[MediaSpeedupRule, ...]:
-        """解析后的上传前倍速规则"""
-        return _speedup_rules_for(tuple(self.plite_media_speedup_rules))
+    def media_speedup_rules(self) -> dict[tuple[PlatformEnum, str], float]:
+        """上传前变速规则 ``{(平台, 作者 id): 倍速}``"""
+        return parse_media_speedup_rules(self.plite_media_speedup_rules)
 
     @property
     def media_transcode_concurrency(self) -> int:
-        """上传前预处理允许的并发数"""
+        """上传前预处理允许的并发转码数"""
         return self.plite_media_transcode_concurrency
 
     @property
     def sponsorblock_api_base(self) -> str | None:
-        """SponsorBlock 兼容服务基地址，未配置时返回 None"""
-        base = self.plite_sponsorblock_api_base
-        if base is None:
-            return None
-        return base.strip().rstrip("/")
+        """SponsorBlock 兼容服务基地址，未配置时为 None"""
+        return self.plite_sponsorblock_api_base
 
     @property
     def sponsorblock_categories(self) -> list[str]:

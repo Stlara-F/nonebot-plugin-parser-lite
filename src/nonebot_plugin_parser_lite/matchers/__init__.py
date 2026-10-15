@@ -24,9 +24,9 @@ from ..delivery import send_with_media_fallback
 from ..download import DOWNLOADER
 from ..helper import UniHelper
 from ..parsers.base import BaseParser, ParseResult
-from ..preprocess import plan_media_edits
 from ..render import RENDERER
 from ..utils.common import LimitedSizeDict
+from ..utils.media_edit import plan_media_edits
 from .rule import Searched, SearchResult, _extract_text, on_keyword_regex
 
 # 关键词 / 类型 -> Parser 映射

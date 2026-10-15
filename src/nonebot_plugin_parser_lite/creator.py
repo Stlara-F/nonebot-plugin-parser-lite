@@ -162,7 +162,7 @@ class Creator:
             path_task=video_task, cover=cover_task, duration=duration
         )
         if origin_ids:
-            video_content.origin_ids = dict(origin_ids)
+            video_content.origin_ids = origin_ids
         return _with_need_send(video_content, need_send)
 
     @staticmethod

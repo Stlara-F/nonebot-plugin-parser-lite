@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 from typing import Any, Literal, TypedDict
 
 from anyio import Path
+from nonebot import logger
 
 from .config import pconfig
 from .constants import STICKER_CDN, PlatformEnum
@@ -12,18 +14,13 @@ from .download import DOWNLOADER
 from .download.task import DownloadTaskWrapper
 from .exception import SizeLimitException
 from .utils.cache import CacheManager
-from .utils.ffmpeg import FFmpeg
+from .utils.ffmpeg import FFmpeg, transcode_gate
 
 ImageLayout = Literal["grid", "x"]
 
 
 def repr_path_task(path_task: DownloadTaskWrapper[Path]) -> str:
     return f"url={path_task.url!r}"
-
-
-def _fmt_seconds(value: float) -> str:
-    """把秒数格式化成稳定、可比较的短字符串，用于缓存签名"""
-    return f"{value:.3f}".rstrip("0").rstrip(".")
 
 
 def _ranges_length(ranges: tuple[tuple[float, float], ...]) -> float:
@@ -48,12 +45,11 @@ def _format_hms(duration: float) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class VideoEditPlan:
-    """上传前对视频时间轴的一次编辑意图。
+class MediaEditPlan:
+    """上传前对媒体时间轴的一次编辑意图
 
-    区间一律使用源视频时间轴（秒），由构造方负责排序、裁剪与合并；
-    产物时长统一通过 `output_duration` 换算，渲染侧也读同一个来源，
-    避免出现卡片时长与实际文件不一致。
+    区间一律用源时间轴（秒），由构造方负责排序、裁剪与合并；产物时长统一走
+    `output_duration`，裁切与消音只对视频有意义。
     """
 
     speed_ratio: float = 1.0
@@ -81,15 +77,24 @@ class VideoEditPlan:
         remaining = max(0.0, source_duration - self.removed_duration)
         return remaining / self.speed_ratio
 
-    def signature(self) -> str:
-        """参与产物文件名的指纹；任何影响输出的输入都要进这里"""
-        cuts = ",".join(
-            f"{_fmt_seconds(start)}-{_fmt_seconds(end)}" for start, end in self.cut_ranges
-        )
-        mutes = ",".join(
-            f"{_fmt_seconds(start)}-{_fmt_seconds(end)}" for start, end in self.mute_ranges
-        )
-        return f"r{_fmt_seconds(self.speed_ratio)}|c[{cuts}]|m[{mutes}]"
+    def digest(self) -> str:
+        """计划指纹，舍掉任何一位精度都可能让两个不同的计划命中同一张卡片"""
+        raw = repr((self.speed_ratio, self.cut_ranges, self.mute_ranges))
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+
+    def cache_name(self, source_path: Path) -> str:
+        """缓存产物名：先摆出看得懂的倍速和裁切标记，再跟一段指纹避免撞车
+
+        指纹要连源路径一起算，只取主干的话两个不同目录下的同名源会命中同一个
+        产物。分隔符用 ``-`` 不用冒号，Windows 的文件名不允许冒号。
+        """
+        label = "cliped" if self.cut_ranges else "no_clip"
+        if self.mute_ranges:
+            label += "_mute"
+        stamp = hashlib.md5(
+            f"{source_path}|{self.digest()}".encode()
+        ).hexdigest()[:8]
+        return f"{source_path.stem}-{self.speed_ratio:.2f}x-{label}-{stamp}"
 
 
 @dataclass(repr=False, slots=True)
@@ -103,11 +108,13 @@ class MediaContent:
     is_dynamic_size: bool = field(default=False, init=False)
     """流媒体在下载完成前无法确定文件大小"""
     origin_ids: dict[str, str] = field(default_factory=dict, init=False, repr=False)
-    """平台侧的稳定标识（如 bvid / cid），供上传前预处理查表使用，不进渲染数据"""
+    """平台侧的稳定标识（如 bvid / cid），供上传前预处理查表"""
+    edit_plan: MediaEditPlan | None = field(default=None, init=False, repr=False)
+    """上传前预处理计划，渲染层和 get_path 的共同依据"""
 
     async def get_path(self) -> Path:
         """
-        获取媒体文件路径
+        获取媒体文件路径，带编辑计划时返回产物而不是原片
 
         :raise ZeroSizeException:  文件大小为零
         :raise SizeLimitException: 文件大小超过限制
@@ -120,6 +127,28 @@ class MediaContent:
         self._size_bytes = (await path.stat()).st_size
         if self._size_bytes > max_size_bytes:
             raise SizeLimitException(self._size_bytes / 1024 / 1024)
+
+        plan = self.edit_plan
+        if plan is None or plan.is_noop:
+            return path
+        return await self.apply_edit_plan(path, plan)
+
+    async def apply_edit_plan(self, path: Path, plan: MediaEditPlan) -> Path:
+        """按计划产出产物；缺 ffmpeg、失败或产物超限都退回原片并清掉计划"""
+        if not await FFmpeg.is_available():
+            logger.warning("ffmpeg 不可用，跳过上传前预处理")
+            self.edit_plan = None
+            return path
+        try:
+            async with transcode_gate():
+                return await self.transcode(path, plan)
+        except Exception as e:
+            logger.warning(f"上传前预处理失败，改用原始文件: {type(e).__name__}: {e!r}")
+        self.edit_plan = None
+        return path
+
+    async def transcode(self, path: Path, plan: MediaEditPlan) -> Path:
+        """按计划在 path 上产出产物，由具体媒体类型实现"""
         return path
 
     @staticmethod
@@ -159,15 +188,44 @@ class MediaContent:
         return f"{prefix}({repr_path_task(self.path_task)})"
 
 
+def _edited_size_text(size_bytes: int, duration: float, plan: MediaEditPlan) -> str:
+    """按保留时长等比估一个产物体积，``~`` 前缀表示近似值"""
+    edited = size_bytes * plan.output_duration(duration) / duration
+    return f"~{MediaContent._format_size(int(edited))}"
+
+
 @dataclass(repr=False, slots=True)
 class AudioContent(MediaContent):
     """音频内容"""
 
     duration: float = 0.0
+    """时长 单位: 秒"""
+
+    @property
+    def effective_duration(self) -> float:
+        """有编辑计划时返回产物时长，否则返回源时长"""
+        plan = self.edit_plan
+        if plan is not None and not plan.is_noop:
+            return plan.output_duration(self.duration)
+        return self.duration
 
     @property
     def display_duration(self) -> str:
-        return _format_hms(self.duration)
+        return _format_hms(self.effective_duration)
+
+    async def get_display_size(self) -> str:
+        plan = self.edit_plan
+        if plan is not None and not plan.is_noop and self._size_bytes:
+            return _edited_size_text(self._size_bytes, self.duration, plan)
+        return await MediaContent.get_display_size(self)
+
+    async def transcode(self, path: Path, plan: MediaEditPlan) -> Path:
+        return await FFmpeg.edit_audio(
+            path,
+            plan.cache_name(path),
+            speed_ratio=plan.speed_ratio,
+            max_size_mb=pconfig.max_size,
+        )
 
 
 @dataclass(repr=False, slots=True)
@@ -178,8 +236,6 @@ class VideoContent(MediaContent):
     """视频封面"""
     duration: float = 0.0
     """时长 单位: 秒"""
-    edit_plan: VideoEditPlan | None = field(default=None, init=False, repr=False)
-    """上传前预处理计划；渲染层据此换算展示时长，不就地改写 duration"""
 
     async def get_cover_path(self) -> Path | None:
         return None if self.cover is None else await self.cover
@@ -187,8 +243,9 @@ class VideoContent(MediaContent):
     @property
     def effective_duration(self) -> float:
         """有编辑计划时返回产物时长，否则返回源时长"""
-        if self.edit_plan is not None and not self.edit_plan.is_noop:
-            return self.edit_plan.output_duration(self.duration)
+        plan = self.edit_plan
+        if plan is not None and not plan.is_noop:
+            return plan.output_duration(self.duration)
         return self.duration
 
     @property
@@ -196,11 +253,20 @@ class VideoContent(MediaContent):
         return _format_hms(self.effective_duration)
 
     async def get_display_size(self) -> str:
-        """变速/裁切后的体积要到转码结束才可知，避免显示源文件体积误导"""
-        if self.edit_plan is not None and not self.edit_plan.is_noop:
-            return "处理后变化"
-        # slots dataclass 会重建类，零参 super() 在这里会指向旧类，因此显式指定基类
+        plan = self.edit_plan
+        if plan is not None and not plan.is_noop and self._size_bytes:
+            return _edited_size_text(self._size_bytes, self.duration, plan)
         return await MediaContent.get_display_size(self)
+
+    async def transcode(self, path: Path, plan: MediaEditPlan) -> Path:
+        return await FFmpeg.edit_video(
+            path,
+            plan.cache_name(path),
+            speed_ratio=plan.speed_ratio,
+            cut_ranges=plan.cut_ranges,
+            mute_ranges=plan.mute_ranges,
+            max_size_mb=pconfig.max_size,
+        )
 
 
 @dataclass(repr=False, slots=True)
