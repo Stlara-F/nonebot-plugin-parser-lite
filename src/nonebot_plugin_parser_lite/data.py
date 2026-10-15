@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime
-import hashlib
 from typing import Any, Literal, TypedDict
 
 from anyio import Path
@@ -14,40 +14,14 @@ from .download import DOWNLOADER
 from .download.task import DownloadTaskWrapper
 from .exception import SizeLimitException
 from .utils.cache import CacheManager
-from .utils.ffmpeg import FFmpeg, transcode_gate
+from .utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
+from .utils.format import format_duration
 
 ImageLayout = Literal["grid", "x"]
 
 
 def repr_path_task(path_task: DownloadTaskWrapper[Path]) -> str:
     return f"url={path_task.url!r}"
-
-
-def _format_hms(duration: float) -> str:
-    """把秒数格式化为 m:ss 或 h:mm:ss"""
-    try:
-        total_seconds = int(duration)
-        if total_seconds <= 0:
-            return "0:00"
-
-        minutes, seconds = divmod(total_seconds, 60)
-        if minutes < 60:
-            return f"{minutes}:{seconds:02d}"
-
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    except (TypeError, ValueError):
-        return "NaN"
-
-
-def _speedup_name(path: Path, ratio: float) -> str:
-    """倍速产物名：先摆出看得懂的倍速，再跟一段指纹避免不同源撞车
-
-    指纹连源路径一起算，只取主干的话两个不同目录下的同名源会命中同一个产物。
-    分隔符用 ``-`` 不用冒号，Windows 的文件名不允许冒号。
-    """
-    stamp = hashlib.md5(f"{path}|{ratio}".encode()).hexdigest()[:8]
-    return f"{path.stem}-{ratio:.2f}x-{stamp}"
 
 
 @dataclass(repr=False, slots=True)
@@ -90,7 +64,7 @@ class MediaContent:
             self.speedup = 1.0
             return path
         try:
-            async with transcode_gate():
+            async with TRANSCODE_LIMIT.get() or contextlib.nullcontext():
                 return await self.retime(path, self.speedup)
         except Exception as e:
             logger.warning(f"上传前倍速失败，改用原始文件: {type(e).__name__}: {e!r}")
@@ -146,13 +120,8 @@ class AudioContent(MediaContent):
     """时长 单位: 秒"""
 
     @property
-    def effective_duration(self) -> float:
-        """倍速后的时长，卡片按它显示"""
-        return self.duration / self.speedup if self.speedup != 1.0 else self.duration
-
-    @property
     def display_duration(self) -> str:
-        return _format_hms(self.effective_duration)
+        return format_duration(self.duration / self.speedup)
 
     async def get_display_size(self) -> str:
         # 变速后的体积只能等比估，``~`` 前缀表示近似值
@@ -162,10 +131,7 @@ class AudioContent(MediaContent):
 
     async def retime(self, path: Path, ratio: float) -> Path:
         return await FFmpeg.edit_audio(
-            path,
-            _speedup_name(path, ratio),
-            speed_ratio=ratio,
-            max_size_mb=pconfig.max_size,
+            path, speed_ratio=ratio, max_size_mb=pconfig.max_size
         )
 
 
@@ -182,13 +148,8 @@ class VideoContent(MediaContent):
         return None if self.cover is None else await self.cover
 
     @property
-    def effective_duration(self) -> float:
-        """倍速后的时长，卡片按它显示"""
-        return self.duration / self.speedup if self.speedup != 1.0 else self.duration
-
-    @property
     def display_duration(self) -> str:
-        return _format_hms(self.effective_duration)
+        return format_duration(self.duration / self.speedup)
 
     async def get_display_size(self) -> str:
         # 变速后的体积只能等比估，``~`` 前缀表示近似值
@@ -198,10 +159,7 @@ class VideoContent(MediaContent):
 
     async def retime(self, path: Path, ratio: float) -> Path:
         return await FFmpeg.edit_video(
-            path,
-            _speedup_name(path, ratio),
-            speed_ratio=ratio,
-            max_size_mb=pconfig.max_size,
+            path, speed_ratio=ratio, max_size_mb=pconfig.max_size
         )
 
 

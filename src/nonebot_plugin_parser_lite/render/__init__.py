@@ -50,7 +50,7 @@ MAX_FORWARD_NODES = 90
 """单个 forward 节点数上限"""
 
 IS_DEBUG = gconfig.log_level in ["DEBUG", "TRACE", 10, 5]
-RENDER_TEMPLATE_VERSION = "20260923-1"
+RENDER_TEMPLATE_VERSION = "20261016-1"
 
 Theme = Literal["light", "dark"]
 TEXT_SPLIT_PUNCTUATION = frozenset("。！？!?；;，,、…")
@@ -780,11 +780,10 @@ class Renderer:
         selected_theme = await self._resolve_theme()
         render_format = pconfig.render_format
         # 卡片上的时长与体积按倍速换算，倍速变了就得重渲染
-        speed_key = speedup_digest(result)
         cache_key = (
             f"{RENDER_TEMPLATE_VERSION}:{selected_theme.id}:"
             f"{selected_theme.version}:{theme}:{result.url}"
-            + (f":{speed_key}" if speed_key else "")
+            f":{speedup_digest(result)}"
         )
         file_name = f"{uuid.uuid5(uuid.NAMESPACE_URL, cache_key)}.{render_format}"
         cache_dir = await CacheManager.ensure_dir(CacheManager.RENDER)

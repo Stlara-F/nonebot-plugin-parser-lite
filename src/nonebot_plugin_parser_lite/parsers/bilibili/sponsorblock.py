@@ -4,8 +4,8 @@
 让下载链路退回原始文件。
 """
 
-from collections.abc import Iterable
-import hashlib
+from collections.abc import Collection, Iterable
+import contextlib
 import json
 import math
 from typing import Any
@@ -16,7 +16,7 @@ from nonebot import logger
 
 from ...config import pconfig
 from ...constants import MIN_KEEP_PIECE_SECONDS
-from ...utils.ffmpeg import FFmpeg, transcode_gate
+from ...utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
 
 REQUEST_TIMEOUT = 5.0
 """查询超时，免得第三方实例拖慢整条解析链路"""
@@ -95,10 +95,14 @@ async def fetch_segments(
     base_url: str,
     bvid: str,
     cid: str,
-    categories: list[str],
+    categories: Iterable[str],
 ) -> list[SponsorSegment]:
     """查询这条视频标记的片段"""
-    params = {"videoID": bvid, "cid": cid, "categories": json.dumps(categories)}
+    params = {
+        "videoID": bvid,
+        "cid": cid,
+        "categories": json.dumps(sorted(categories)),
+    }
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.get(
@@ -153,7 +157,7 @@ def _normalize_ranges(
 
 async def skip_ranges(
     api_base: str,
-    categories: list[str],
+    categories: Collection[str],
     bvid: str,
     cid: str,
     duration: float,
@@ -198,8 +202,8 @@ async def skip_for_video(
     没配服务地址、没拿到 cid 或时长未知时一律返回「不处理」，此时视频照常下载，
     缓存标识也不受影响。
     """
-    api_base = pconfig.sponsorblock_api_base
-    categories = pconfig.sponsorblock_categories
+    api_base = pconfig.bsb_api_base
+    categories = pconfig.bsb_categories
     if not api_base or not categories or cid is None or duration <= 0:
         return (), (), 0.0
     return await skip_ranges(api_base, categories, bvid, str(cid), duration)
@@ -213,8 +217,6 @@ async def skip_video(
     """按标注产出空降后的视频；缺 ffmpeg 或失败都退回原片
 
     倍速是通用能力，留给 ``MediaContent.get_path``；两者同时命中时这里先出成片。
-    产物名带标注指纹，标注更新或换了分类都不会命中旧产物。冒号在 Windows 的文件
-    名里不合法，分隔符只用 ``-``。
     """
     if not cut_ranges and not mute_ranges:
         return path
@@ -222,13 +224,10 @@ async def skip_video(
         logger.warning("ffmpeg 不可用，跳过空降裁切")
         return path
 
-    raw = f"{path}|{cut_ranges}|{mute_ranges}"
-    stamp = hashlib.md5(raw.encode()).hexdigest()[:8]
     try:
-        async with transcode_gate():
+        async with TRANSCODE_LIMIT.get() or contextlib.nullcontext():
             return await FFmpeg.edit_video(
                 path,
-                f"{path.stem}-skip-{stamp}",
                 cut_ranges=cut_ranges,
                 mute_ranges=mute_ranges,
                 max_size_mb=pconfig.max_size,

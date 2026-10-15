@@ -27,25 +27,22 @@ def parse_hm_to_minutes(value: str) -> int:
     return hour * 60 + minute
 
 
-SPONSORBLOCK_CATEGORIES = frozenset(
-    {
-        "sponsor",
-        "selfpromo",
-        "exclusive_access",
-        "interaction",
-        "poi_highlight",
-        "intro",
-        "outro",
-        "preview",
-        "padding",
-        "filler",
-        "music_offtopic",
-    }
-)
-"""BilibiliSponsorBlock 接受的片段分类，必须与服务端一致：传入未知分类时服务会用
-HTTP 400 拒绝**整个请求**（实测返回 ``["Unknown category provided."]``），而不是
-只忽略那一项，所以在配置阶段就拦住笔误。能不能真裁掉还取决于返回的 actionType
-（``exclusive_access`` 只带 ``full``、``poi_highlight`` 只带 ``poi``，都不裁切）。"""
+BsbCategory = Literal[
+    "sponsor",
+    "selfpromo",
+    "exclusive_access",
+    "interaction",
+    "poi_highlight",
+    "intro",
+    "outro",
+    "preview",
+    "padding",
+    "filler",
+    "music_offtopic",
+]
+"""BilibiliSponsorBlock 的片段分类，取值须与服务端一致：未知分类会让服务用 HTTP 400
+拒绝整个请求。能否真裁掉还取决于返回的 actionType（skip 删区间，mute 只消音，
+full/poi 不处理）。"""
 
 
 def parse_media_speedup_rules(
@@ -149,21 +146,13 @@ class Config(BaseModel):
     plite_render_format: Literal["jpeg", "webp"] = "webp"
     """渲染图片格式，jpeg会丢失透明度但可能兼容性更好"""
     plite_media_speedup_rules: list[str] = []
-    """上传前按「平台+作者」对视频和音频做倍速，格式 平台:作者id:倍速，
-    如 ["bilibili:123456:1.25"]；作者 id 即解析结果的 author.id。
-    命中即重新编码，产物为有损，需 ffmpeg"""
+    """媒体倍速规则，格式 `平台:作者id:倍速`"""
     plite_media_transcode_concurrency: int = 1
-    """上传前预处理允许的同时转码数，与卡片渲染的并发限制互相独立；修改后需重启生效"""
-    plite_sponsorblock_api_base: str | None = None
-    """哔哩哔哩空降用的 SponsorBlock 兼容服务基地址，留空表示不启用、不外发任何请求。
-    上游项目的官方服务是 ``https://www.bsbsb.top``（镜像 ``https://www.bsbsb.xyz``），
-    由 B站去广告插件项目自行运营；填在这里就等于你信任它返回的时间区间"""
-    plite_sponsorblock_categories: list[str] = []
-    """参与裁切的片段分类白名单，配置了服务地址时必填；
-    可选 sponsor/selfpromo/exclusive_access/interaction/poi_highlight/intro/
-    outro/preview/padding/filler/music_offtopic（须与服务端一致，未知分类会让
-    整个请求返回 400）。实际是否裁掉还取决于服务返回的 actionType
-    （skip 删除区间，mute 只消音，full/poi 不处理）"""
+    """媒体倍速并发操作数"""
+    plite_bsb_api_base: str | None = None
+    """哔哩哔哩空降服务地址, wiki: https://github.com/hanydd/BilibiliSponsorBlock/wiki/API"""
+    plite_bsb_categories: set[BsbCategory] = set()
+    """参与裁切的片段分类，配置了服务地址时必填"""
 
     @field_validator("plite_download_command")
     @classmethod
@@ -189,33 +178,17 @@ class Config(BaseModel):
         parse_media_speedup_rules(value)
         return [item.strip() for item in value if item.strip()]
 
-    @field_validator("plite_sponsorblock_categories")
+    @field_validator("plite_bsb_api_base")
     @classmethod
-    def validate_sponsorblock_categories(cls, value: list[str]) -> list[str]:
-        categories = list(
-            dict.fromkeys(
-                item for item in (entry.strip().casefold() for entry in value) if item
-            )
-        )
-        unknown = [item for item in categories if item not in SPONSORBLOCK_CATEGORIES]
-        if unknown:
-            raise ValueError(
-                f"未知的片段分类 {unknown}，可用: "
-                f"{', '.join(sorted(SPONSORBLOCK_CATEGORIES))}"
-            )
-        return categories
+    def validate_bsb_api_base(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("http"):
+            raise ValueError("哔哩哔哩空降服务地址需以 http 开头")
+        return value
 
     @model_validator(mode="after")
     def validate_lazy_download(self) -> "Config":
         if self.plite_lazy_download and not self.plite_download_command:
             raise ValueError("开启懒下载时至少需要配置一条下载命令")
-        return self
-
-    @model_validator(mode="after")
-    def validate_sponsorblock_api_base(self) -> "Config":
-        base = self.plite_sponsorblock_api_base
-        if base is not None and not base.startswith("http"):
-            raise ValueError("SponsorBlock 服务地址需以 http 开头")
         return self
 
     @property
@@ -407,23 +380,23 @@ class Config(BaseModel):
 
     @property
     def media_speedup_rules(self) -> dict[tuple[PlatformEnum, str], float]:
-        """上传前变速规则 ``{(平台, 作者 id): 倍速}``"""
+        """媒体倍速规则"""
         return parse_media_speedup_rules(self.plite_media_speedup_rules)
 
     @property
     def media_transcode_concurrency(self) -> int:
-        """上传前预处理允许的并发转码数"""
+        """媒体倍速并发操作数"""
         return self.plite_media_transcode_concurrency
 
     @property
-    def sponsorblock_api_base(self) -> str | None:
-        """SponsorBlock 兼容服务基地址，未配置时为 None"""
-        return self.plite_sponsorblock_api_base
+    def bsb_api_base(self) -> str | None:
+        """哔哩哔哩空降服务地址"""
+        return self.plite_bsb_api_base
 
     @property
-    def sponsorblock_categories(self) -> list[str]:
+    def bsb_categories(self) -> set[BsbCategory]:
         """参与裁切的片段分类"""
-        return self.plite_sponsorblock_categories
+        return self.plite_bsb_categories
 
 
 # 初始化配置实例

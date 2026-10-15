@@ -209,7 +209,7 @@ async def test_real_skip_cuts_and_mutes_the_annotated_ranges(source_video: Path)
         )
     )
     assert product != source_video
-    assert product.name.startswith("source-skip-")
+    assert product.suffix == ".mp4", "空降成片统一封装成 mp4"
     assert probe_duration(product) == pytest.approx(15.0, abs=0.4)
     # 原片 8-10 秒被消音，裁掉开头 5 秒后落在产物时间轴的 3 秒起
     assert mean_volume(product, 3.2) < -60.0

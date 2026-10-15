@@ -279,6 +279,7 @@ async def _serialize_content(
             "type": "video",
             "src": await safe_src(item, "get_cover_path"),
             "duration": item.display_duration,
+            "speedup": _speedup_label(item),
             "size": await _display_size(item),
             "source_url": _task_url(item),
         }
@@ -286,6 +287,7 @@ async def _serialize_content(
         return {
             "type": "audio",
             "duration": item.display_duration,
+            "speedup": _speedup_label(item),
             "size": await _display_size(item),
             "source_url": _task_url(item),
         }
@@ -334,6 +336,11 @@ async def _serialize_content(
             "has_images": any(option.image is not None for option in item.options),
         }
     return {"type": "unknown", "text": str(item)}
+
+
+def _speedup_label(item: MediaContent) -> str | None:
+    """倍速标签，1 倍速时不占位"""
+    return None if item.speedup == 1.0 else f"{item.speedup:g}x"
 
 
 async def _display_size(item: MediaContent) -> str:

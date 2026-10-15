@@ -26,6 +26,7 @@ from ..helper import UniHelper
 from ..parsers.base import BaseParser, ParseResult
 from ..render import RENDERER
 from ..utils.common import LimitedSizeDict
+from ..utils.ffmpeg import TRANSCODE_LIMIT
 from ..utils.media_edit import apply_media_speedup
 from .rule import Searched, SearchResult, _extract_text, on_keyword_regex
 
@@ -157,30 +158,36 @@ async def parser_handler(
     sr: SearchResult = Searched(),
 ):
     """统一的解析处理器"""
-    result = await _get_or_parse_result(sr)
+    # 转码上限按每条消息独立创建，避免模块级信号量绑定到旧事件循环
+    limit = asyncio.Semaphore(pconfig.media_transcode_concurrency)
+    token = TRANSCODE_LIMIT.set(limit)
+    try:
+        result = await _get_or_parse_result(sr)
 
-    # 上传前倍速必须在渲染之前定稿，卡片上的时长才是最终文件的时长
-    apply_media_speedup(result)
+        # 上传前倍速必须在渲染之前定稿，卡片上的时长才是最终文件的时长
+        apply_media_speedup(result)
 
-    summary_msg = await RENDERER.render_messages(result)
-    summary_in_forward = pconfig.summary_in_forward and not pconfig.lazy_download
-    if not summary_in_forward:
-        await send_with_media_fallback(summary_msg, result)
+        summary_msg = await RENDERER.render_messages(result)
+        summary_in_forward = pconfig.summary_in_forward and not pconfig.lazy_download
+        if not summary_in_forward:
+            await send_with_media_fallback(summary_msg, result)
 
-    if pconfig.lazy_download:
-        if pconfig.lazy_download_tip:
-            download_cmd = ", ".join(pconfig.download_command)
-            await UniMessage(
-                f"请在{LazyManager.TIMEOUT_SECONDS}秒内发送以下命令之一来获取媒体资源: "
-                f"\n{download_cmd}"
-            ).send()
-        await LazyManager.add(LazyManager.session_key(session), result)
-    else:
-        async for content_msg in RENDERER.send_content(
-            result,
-            summary_node=summary_msg if summary_in_forward else None,
-        ):
-            await send_with_media_fallback(content_msg, result)
+        if pconfig.lazy_download:
+            if pconfig.lazy_download_tip:
+                download_cmd = ", ".join(pconfig.download_command)
+                await UniMessage(
+                    f"请在{LazyManager.TIMEOUT_SECONDS}秒内发送以下命令之一来获取媒体资源: "
+                    f"\n{download_cmd}"
+                ).send()
+            await LazyManager.add(LazyManager.session_key(session), result)
+        else:
+            async for content_msg in RENDERER.send_content(
+                result,
+                summary_node=summary_msg if summary_in_forward else None,
+            ):
+                await send_with_media_fallback(content_msg, result)
+    finally:
+        TRANSCODE_LIMIT.reset(token)
 
 
 @driver.on_startup

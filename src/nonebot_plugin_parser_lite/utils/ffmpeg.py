@@ -1,6 +1,7 @@
 import asyncio
 from asyncio.subprocess import Process
 from collections.abc import Callable
+from contextvars import ContextVar
 from fractions import Fraction
 import hashlib
 import json
@@ -11,35 +12,15 @@ from uuid import uuid4
 from anyio import Path
 from nonebot import logger
 
-from ..config import pconfig
 from ..constants import MIN_KEEP_PIECE_SECONDS
 from ..exception import SizeLimitException
 from .cache import CacheManager
 from .common import fmt_size
 
-MP4_LIKE_SUFFIXES = {".mp4", ".m4a", ".m4s", ".mov"}
-
-_gate_loop: asyncio.AbstractEventLoop | None = None
-_gate: asyncio.Semaphore | None = None
-
-
-def transcode_gate() -> asyncio.Semaphore:
-    """同时转码的闸门
-
-    信号量按当前事件循环创建，模块级对象会绑死在第一个循环上（render/context.py
-    里是同样的顾虑）。
-    """
-    global _gate_loop, _gate
-    loop = asyncio.get_running_loop()
-    if _gate is None or _gate_loop is not loop:
-        _gate_loop = loop
-        _gate = asyncio.Semaphore(pconfig.media_transcode_concurrency)
-    return _gate
-
-
-def _pad(target: str) -> str:
-    """把流描述符包成滤镜图里的输入标签（0:v -> [0:v]），已加括号的标签原样返回"""
-    return target if target.startswith("[") else f"[{target}]"
+TRANSCODE_LIMIT: ContextVar[asyncio.Semaphore | None] = ContextVar(
+    "parser_lite_transcode_limit", default=None
+)
+"""同时转码的上限，由处理入口按配置创建；每次独立创建以免绑定到旧事件循环"""
 
 
 class FFmpeg:
@@ -683,6 +664,16 @@ class FFmpeg:
         )
         return output_path
 
+    @classmethod
+    async def _get_edit_output_path(
+        cls, input_path: Path, suffix: str, *params: Any
+    ) -> Path:
+        """按源路径与编辑参数算出产物名，参数变了就不会命中旧产物"""
+        cache_key = ",".join([str(input_path), *(str(param) for param in params)])
+        file_name = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+        cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
+        return cache_dir / f"{file_name}{suffix}"
+
     @staticmethod
     def _build_keep_pieces(
         cut_ranges: tuple[tuple[float, float], ...],
@@ -777,7 +768,6 @@ class FFmpeg:
     async def edit_video(
         cls,
         input_path: Path,
-        file_name: str,
         *,
         speed_ratio: float = 1.0,
         cut_ranges: tuple[tuple[float, float], ...] = (),
@@ -787,10 +777,9 @@ class FFmpeg:
         """重编码视频，一次 ffmpeg 调用产出终态文件
 
         倍速、裁切、消音可以同时传，落在同一条滤镜链里，避免多代有损编码；只消音
-        时视频流直接复制。产物名由调用方给出，命中缓存即复用。
+        时视频流直接复制。产物名由源路径与编辑参数算出，命中缓存即复用。
 
         :param input_path: 源视频路径
-        :param file_name: 输出文件名（不含扩展名）
         :param speed_ratio: 播放倍率
         :param cut_ranges: 需要删除的时间轴区间，需已排序、裁剪且不重叠
         :param mute_ranges: 需要消音的时间轴区间，按源时间轴表达
@@ -798,8 +787,9 @@ class FFmpeg:
 
         :return: 产物路径
         """
-        cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
-        output_path = cache_dir / f"{file_name}.mp4"
+        output_path = await cls._get_edit_output_path(
+            input_path, ".mp4", speed_ratio, cut_ranges, mute_ranges
+        )
         if await output_path.exists():
             return output_path
 
@@ -820,31 +810,29 @@ class FFmpeg:
         needs_trim = bool(cut_ranges)
 
         filter_parts: list[str] = []
-        video_target = "0:v"
+        # 滤镜图里引用输入流要带方括号，-map 直接引用输入流时不带
+        video_source, video_target = "[0:v]", "0:v"
+        audio_source = "[0:a]" if has_audio else None
         audio_target = "0:a" if has_audio else None
 
         if needs_trim:
             filter_parts, video_target, audio_target = cls._build_timeline_filter(
                 pieces, mute_ranges, has_audio=has_audio
             )
+            video_source, audio_source = video_target, audio_target
         elif has_audio and mute_ranges:
             enable = cls._build_mute_expression(mute_ranges)
             filter_parts.append(f"[0:a]volume=enable='{enable}':volume=0[at]")
-            audio_target = "[at]"
+            audio_source = audio_target = "[at]"
 
         video_filtered = needs_trim or speed_ratio != 1.0
         if speed_ratio != 1.0:
-            filter_parts.append(
-                f"{_pad(video_target)}setpts=PTS/"
-                f"{cls._format_filter_number(speed_ratio)}[vf]"
-            )
-            video_target = "[vf]"
-            if audio_target is not None:
-                filter_parts.append(
-                    f"{_pad(audio_target)}atempo="
-                    f"{cls._format_filter_number(speed_ratio)}[af]"
-                )
-                audio_target = "[af]"
+            ratio = cls._format_filter_number(speed_ratio)
+            filter_parts.append(f"{video_source}setpts=PTS/{ratio}[vf]")
+            video_source = video_target = "[vf]"
+            if audio_source is not None:
+                filter_parts.append(f"{audio_source}atempo={ratio}[af]")
+                audio_source = audio_target = "[af]"
 
         cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
         cmd += ["-i", str(input_path)]
@@ -892,7 +880,6 @@ class FFmpeg:
     async def edit_audio(
         cls,
         input_path: Path,
-        file_name: str,
         *,
         speed_ratio: float,
         max_size_mb: int = 90,
@@ -903,15 +890,13 @@ class FFmpeg:
         一起去掉，语音/文件消息用不到它。
 
         :param input_path: 源音频路径
-        :param file_name: 输出文件名（不含扩展名），扩展名沿用源文件
         :param speed_ratio: 播放倍率
         :param max_size_mb: 产物体积上限，超限时中止并抛 SizeLimitException
 
         :return: 产物路径
         """
-        cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
         suffix = input_path.suffix.lower() or ".m4a"
-        output_path = cache_dir / f"{file_name}{suffix}"
+        output_path = await cls._get_edit_output_path(input_path, suffix, speed_ratio)
         if await output_path.exists():
             return output_path
 
@@ -924,8 +909,6 @@ class FFmpeg:
             f"atempo={cls._format_filter_number(speed_ratio)}",
         ]
         # 编码器与码率交给 ffmpeg 按输出后缀决定
-        if suffix in MP4_LIKE_SUFFIXES:
-            cmd += ["-movflags", "+faststart"]
         logger.info(f"Editing audio '{input_path.name}' as '{output_path.name}'")
         temp_path = cls.temporary_output_path(output_path)
         cmd += [str(temp_path)]
