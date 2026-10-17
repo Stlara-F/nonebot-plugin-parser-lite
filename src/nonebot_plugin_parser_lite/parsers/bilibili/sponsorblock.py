@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 import json
-import math
 from typing import Any
 
 from anyio import Path
