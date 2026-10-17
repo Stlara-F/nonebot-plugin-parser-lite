@@ -1,26 +1,40 @@
 import asyncio
 from asyncio.subprocess import Process
 from collections.abc import Callable
-from contextvars import ContextVar
 from fractions import Fraction
 import hashlib
 import json
 import math
 from typing import Any
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from anyio import Path
 from nonebot import logger
 
+from ..config import pconfig
 from ..constants import MIN_KEEP_PIECE_SECONDS
 from ..exception import SizeLimitException
 from .cache import CacheManager
 from .common import fmt_size
 
-TRANSCODE_LIMIT: ContextVar[asyncio.Semaphore | None] = ContextVar(
-    "parser_lite_transcode_limit", default=None
-)
-"""同时转码的上限，由处理入口按配置创建；每次独立创建以免绑定到旧事件循环"""
+_TRANSCODE_LIMITS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, asyncio.Semaphore
+] = WeakKeyDictionary()
+
+
+def get_transcode_limit() -> asyncio.Semaphore:
+    """返回当前事件循环共享的转码信号量
+
+    信号量不能跨事件循环复用，因此按事件循环缓存。懒下载发生在原消息处理
+    结束后，也必须走同一份限制。
+    """
+    loop = asyncio.get_running_loop()
+    cached = _TRANSCODE_LIMITS.get(loop)
+    if cached is None:
+        cached = asyncio.Semaphore(pconfig.media_transcode_concurrency)
+        _TRANSCODE_LIMITS[loop] = cached
+    return cached
 
 
 class FFmpeg:
@@ -772,7 +786,6 @@ class FFmpeg:
         speed_ratio: float = 1.0,
         cut_ranges: tuple[tuple[float, float], ...] = (),
         mute_ranges: tuple[tuple[float, float], ...] = (),
-        max_size_mb: int = 90,
     ) -> Path:
         """重编码视频，一次 ffmpeg 调用产出终态文件
 
@@ -783,8 +796,6 @@ class FFmpeg:
         :param speed_ratio: 播放倍率
         :param cut_ranges: 需要删除的时间轴区间，需已排序、裁剪且不重叠
         :param mute_ranges: 需要消音的时间轴区间，按源时间轴表达
-        :param max_size_mb: 产物体积上限，超限时中止并抛 SizeLimitException
-
         :return: 产物路径
         """
         output_path = await cls._get_edit_output_path(
@@ -866,7 +877,7 @@ class FFmpeg:
         cmd += ["-movflags", "+faststart", str(temp_path)]
         try:
             await cls.exec_ffmpeg_monitored(
-                cmd, output_path=temp_path, max_size_mb=max_size_mb
+                cmd, output_path=temp_path, max_size_mb=pconfig.max_size
             )
             await temp_path.replace(output_path)
         finally:
@@ -882,7 +893,6 @@ class FFmpeg:
         input_path: Path,
         *,
         speed_ratio: float,
-        max_size_mb: int = 90,
     ) -> Path:
         """按倍率重编码音频，产物沿用源文件的容器
 
@@ -891,8 +901,6 @@ class FFmpeg:
 
         :param input_path: 源音频路径
         :param speed_ratio: 播放倍率
-        :param max_size_mb: 产物体积上限，超限时中止并抛 SizeLimitException
-
         :return: 产物路径
         """
         suffix = input_path.suffix.lower() or ".m4a"
@@ -914,7 +922,7 @@ class FFmpeg:
         cmd += [str(temp_path)]
         try:
             await cls.exec_ffmpeg_monitored(
-                cmd, output_path=temp_path, max_size_mb=max_size_mb
+                cmd, output_path=temp_path, max_size_mb=pconfig.max_size
             )
             await temp_path.replace(output_path)
         finally:

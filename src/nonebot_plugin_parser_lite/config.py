@@ -27,36 +27,14 @@ def parse_hm_to_minutes(value: str) -> int:
     return hour * 60 + minute
 
 
-BsbCategory = Literal[
-    "sponsor",
-    "selfpromo",
-    "exclusive_access",
-    "interaction",
-    "poi_highlight",
-    "intro",
-    "outro",
-    "preview",
-    "padding",
-    "filler",
-    "music_offtopic",
-]
-"""BilibiliSponsorBlock 的片段分类，取值须与服务端一致：未知分类会让服务用 HTTP 400
-拒绝整个请求。能否真裁掉还取决于返回的 actionType（skip 删区间，mute 只消音，
-full/poi 不处理）。"""
-
-
 def parse_media_speedup_rules(
     value: list[str],
 ) -> dict[tuple[PlatformEnum, str], float]:
-    """把 ``["bilibili:123456:1.25"]`` 解析成 ``{(平台, 作者 id): 倍速}``
-
-    作者 id 就是 ``ParseResult.author.id``；同一作者重复配置时后者覆盖前者，
-    倍速也不设上下限，配置由使用者负责。
-    """
+    """把 ``["bilibili:123456:1.25"]`` 解析成 ``{(平台, 作者 id): 倍速}``"""
     rules: dict[tuple[PlatformEnum, str], float] = {}
     for raw in value:
         parts = [part.strip() for part in raw.split(":")]
-        if len(parts) != 3 or not (parts[1] and parts[2]):
+        if len(parts) != 3 or not parts[1] or not parts[2]:
             raise ValueError(f"变速规则应为 平台:作者id:倍速，收到: {raw!r}")
         platform_name, author_id, ratio_text = parts
         try:
@@ -151,7 +129,7 @@ class Config(BaseModel):
     """媒体倍速并发操作数"""
     plite_bsb_api_base: str | None = None
     """哔哩哔哩空降服务地址, wiki: https://github.com/hanydd/BilibiliSponsorBlock/wiki/API"""
-    plite_bsb_categories: set[BsbCategory] = set()
+    plite_bsb_categories: list[str] = []
     """参与裁切的片段分类，配置了服务地址时必填"""
 
     @field_validator("plite_download_command")
@@ -177,13 +155,6 @@ class Config(BaseModel):
         # 启动时就解析一遍，笔误不至于等到发消息才静默不生效
         parse_media_speedup_rules(value)
         return [item.strip() for item in value if item.strip()]
-
-    @field_validator("plite_bsb_api_base")
-    @classmethod
-    def validate_bsb_api_base(cls, value: str | None) -> str | None:
-        if value is not None and not value.startswith("http"):
-            raise ValueError("哔哩哔哩空降服务地址需以 http 开头")
-        return value
 
     @model_validator(mode="after")
     def validate_lazy_download(self) -> "Config":
@@ -394,7 +365,7 @@ class Config(BaseModel):
         return self.plite_bsb_api_base
 
     @property
-    def bsb_categories(self) -> set[BsbCategory]:
+    def bsb_categories(self) -> list[str]:
         """参与裁切的片段分类"""
         return self.plite_bsb_categories
 

@@ -2,16 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, MutableSequence, Sequence
 import re
-from typing import TYPE_CHECKING, Final, Literal
+from typing import Final, Literal
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, Tag
 
 from ..constants import STICKER_CDN
-
-if TYPE_CHECKING:
-    from ..data import ContentItem
+from ..data import ContentItem
 
 DEFAULT_PLACEHOLDER_PATTERN: Final = re.compile(r"\[(?P<name>[^]]+)\]")
 HTML_NEWLINE_TAGS: Final = frozenset(
@@ -90,23 +88,6 @@ def format_num(num: int | None) -> str | None:
     if num is None:
         return None
     return str(num) if num < 10000 else f"{num / 10000:.1f}万"
-
-
-def format_duration(duration: float) -> str:
-    """把秒数格式化为 m:ss 或 h:mm:ss"""
-    try:
-        total_seconds = int(duration)
-        if total_seconds <= 0:
-            return "0:00"
-
-        minutes, seconds = divmod(total_seconds, 60)
-        if minutes < 60:
-            return f"{minutes}:{seconds:02d}"
-
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}:{minutes:02d}:{seconds:02d}"
-    except (TypeError, ValueError):
-        return "NaN"
 
 
 def append_html_text(

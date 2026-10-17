@@ -30,10 +30,7 @@ DOWNLOAD_TIMEOUT: Final[Timeout] = Timeout(
 STICKER_CDN: Final[str] = "https://sticker.sokoko.org/assets/{platform}/{name}.webp"
 
 MIN_KEEP_PIECE_SECONDS: Final[float] = 0.05
-"""裁切后保留片段的最小时长，过短的碎片会让 concat 滤镜图失去意义。
-
-转码层会丢掉不超过这个长度的片段，所以计划层在合并区间时必须用同一个阈值，
-否则卡片上算出来的产物时长会比真实文件长。"""
+"""裁切后保留片段的最小时长"""
 
 
 class PlatformEnum(StrEnum):

@@ -1,22 +1,19 @@
-"""哔哩哔哩空降：查询 SponsorBlock 兼容服务，把标注换算成裁切与消音区间。
+"""哔哩哔哩空降：查询 SponsorBlock 兼容服务，把标注换算成裁切与消音区间"""
 
-只读公开的 skipSegments 接口，不提交、不投票；任何异常都按「没有片段」处理，
-让下载链路退回原始文件。
-"""
-
-from collections.abc import Collection, Iterable
-import contextlib
+import asyncio
+from collections.abc import Iterable
+from dataclasses import dataclass
 import json
 import math
 from typing import Any
 
 from anyio import Path
-import httpx
 from nonebot import logger
 
 from ...config import pconfig
 from ...constants import MIN_KEEP_PIECE_SECONDS
-from ...utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
+from ...download import DOWNLOADER
+from ...utils.ffmpeg import FFmpeg, get_transcode_limit
 
 REQUEST_TIMEOUT = 5.0
 """查询超时，免得第三方实例拖慢整条解析链路"""
@@ -25,25 +22,20 @@ STALENESS_TOLERANCE = 2.0
 """标注记录的视频时长与实际时长相差多少秒以内还算对得上（上游约定 ±2 秒）"""
 
 
+SegmentRange = tuple[float, float]
+SegmentRanges = tuple[SegmentRange, ...]
+RangePlan = tuple[SegmentRanges, SegmentRanges, float]
+
+
+@dataclass(frozen=True, slots=True)
 class SponsorSegment:
     """一条归一化后的片段"""
 
-    __slots__ = ("action_type", "category", "end", "recorded_duration", "start")
-
-    def __init__(
-        self,
-        start: float,
-        end: float,
-        category: str,
-        action_type: str,
-        recorded_duration: float | None,
-    ):
-        self.start = start
-        self.end = end
-        self.category = category
-        self.action_type = action_type
-        # 提交时记录的视频时长，服务端约定未知时为 0，这里统一记成 None
-        self.recorded_duration = recorded_duration
+    start: float
+    end: float
+    category: str
+    action_type: str
+    recorded_duration: float | None
 
 
 def _iter_segment_dicts(payload: Any) -> list[dict[str, Any]]:
@@ -64,14 +56,11 @@ def _iter_segment_dicts(payload: Any) -> list[dict[str, Any]]:
 
 def _parse_segment(entry: dict[str, Any]) -> SponsorSegment | None:
     pair = entry.get("segment")
-    if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+    if not isinstance(pair, list | tuple) or len(pair) != 2:
         return None
     try:
         start, end = float(pair[0]), float(pair[1])
     except (TypeError, ValueError):
-        return None
-    # NaN 与 inf 能通过 float()，但所有比较都是 False，会悄悄产出一条乱序裁切
-    if not (math.isfinite(start) and math.isfinite(end)):
         return None
     if start < 0 or end <= start:
         return None
@@ -79,7 +68,7 @@ def _parse_segment(entry: dict[str, Any]) -> SponsorSegment | None:
     if not isinstance(category, str) or not isinstance(action_type, str):
         return None
     try:
-        recorded = float(entry.get("videoDuration"))
+        recorded = float(entry.get("videoDuration", 0))
     except (TypeError, ValueError):
         recorded = 0.0
     return SponsorSegment(
@@ -95,18 +84,16 @@ async def fetch_segments(
     base_url: str,
     bvid: str,
     cid: str,
-    categories: Iterable[str],
+    categories: list[str],
 ) -> list[SponsorSegment]:
     """查询这条视频标记的片段"""
-    params = {
-        "videoID": bvid,
-        "cid": cid,
-        "categories": json.dumps(sorted(categories)),
-    }
+    params = {"videoID": bvid, "cid": cid, "categories": categories}
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(
-                f"{base_url.rstrip('/')}/api/skipSegments", params=params
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            response = await DOWNLOADER.client.get(
+                f"{base_url.rstrip('/')}/api/skipSegments",
+                params=params,
+                headers=DOWNLOADER.headers,
             )
     except Exception as e:
         logger.warning(f"SponsorBlock 查询失败 {bvid}: {type(e).__name__}: {e!r}")
@@ -157,16 +144,12 @@ def _normalize_ranges(
 
 async def skip_ranges(
     api_base: str,
-    categories: Collection[str],
+    categories: list[str],
     bvid: str,
     cid: str,
     duration: float,
-) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...], float]:
-    """取回要裁掉 / 要消音的区间，以及裁掉的总秒数
-
-    分类白名单在配置校验时就对齐过服务端取值；这里再按 actionType 分流，并丢弃
-    标注时长对不上的过期片段（同一条视频的不同片段可能提交于不同版本）。
-    """
+) -> RangePlan:
+    """取回要裁掉 / 要消音的区间，以及裁掉的总秒数"""
     cuts: list[tuple[float, float]] = []
     mutes: list[tuple[float, float]] = []
     for segment in await fetch_segments(api_base, bvid, cid, categories):
@@ -194,14 +177,8 @@ async def skip_ranges(
     )
 
 
-async def skip_for_video(
-    bvid: str, cid: int | None, duration: float
-) -> tuple[tuple[tuple[float, float], ...], tuple[tuple[float, float], ...], float]:
-    """解析阶段查一次空降标注
-
-    没配服务地址、没拿到 cid 或时长未知时一律返回「不处理」，此时视频照常下载，
-    缓存标识也不受影响。
-    """
+async def skip_for_video(bvid: str, cid: int | None, duration: float) -> RangePlan:
+    """查询空降标注"""
     api_base = pconfig.bsb_api_base
     categories = pconfig.bsb_categories
     if not api_base or not categories or cid is None or duration <= 0:
@@ -214,10 +191,7 @@ async def skip_video(
     cut_ranges: tuple[tuple[float, float], ...],
     mute_ranges: tuple[tuple[float, float], ...],
 ) -> Path:
-    """按标注产出空降后的视频；缺 ffmpeg 或失败都退回原片
-
-    倍速是通用能力，留给 ``MediaContent.get_path``；两者同时命中时这里先出成片。
-    """
+    """按标注产出空降后的视频"""
     if not cut_ranges and not mute_ranges:
         return path
     if not await FFmpeg.is_available():
@@ -225,12 +199,9 @@ async def skip_video(
         return path
 
     try:
-        async with TRANSCODE_LIMIT.get() or contextlib.nullcontext():
+        async with get_transcode_limit():
             return await FFmpeg.edit_video(
-                path,
-                cut_ranges=cut_ranges,
-                mute_ranges=mute_ranges,
-                max_size_mb=pconfig.max_size,
+                path, cut_ranges=cut_ranges, mute_ranges=mute_ranges
             )
     except Exception as e:
         logger.warning(f"空降裁切失败，改用原始文件: {type(e).__name__}: {e!r}")

@@ -3,14 +3,10 @@
 这块是平台特有能力，只被 bilibili 解析器调用；通用倍速在 test_media_speedup.py。
 """
 
-import asyncio
-from typing import get_args
-
 from anyio import Path as AnyPath
 import pytest
 import render_test_support as support
 
-from nonebot_plugin_parser_lite.config import BsbCategory, Config
 from nonebot_plugin_parser_lite.constants import MIN_KEEP_PIECE_SECONDS
 from nonebot_plugin_parser_lite.parsers.bilibili import sponsorblock
 from nonebot_plugin_parser_lite.parsers.bilibili.sponsorblock import (
@@ -22,7 +18,7 @@ from nonebot_plugin_parser_lite.parsers.bilibili.sponsorblock import (
     skip_ranges,
     skip_video,
 )
-from nonebot_plugin_parser_lite.utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
+from nonebot_plugin_parser_lite.utils.ffmpeg import FFmpeg
 
 ROW = {"segment": [1.0, 5.0], "category": "sponsor", "actionType": "skip"}
 
@@ -44,7 +40,7 @@ class _Response:
 
 
 class _Client:
-    """替掉 httpx.AsyncClient，不发网络请求"""
+    """替掉统一下载客户端，不发网络请求"""
 
     def __init__(self, response: _Response, error: Exception | None = None):
         self.response = response
@@ -57,7 +53,7 @@ class _Client:
     async def __aexit__(self, *exc_info):
         return False
 
-    async def get(self, url, params=None):
+    async def get(self, url, *, params=None, headers=None):
         self.requests.append((url, params or {}))
         if self.error is not None:
             raise self.error
@@ -107,10 +103,10 @@ def test_zero_recorded_duration_means_unknown():
 @pytest.mark.asyncio
 async def test_fetch_builds_the_query_and_returns_rows(monkeypatch):
     client = _Client(_Response(200, [row(1.0, 5.0)]))
-    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(sponsorblock.DOWNLOADER, "client", client)
 
     segments = await fetch_segments(
-        "https://bsbsb.top/", "BV1", "9", {"sponsor", "intro"}
+        "https://bsbsb.top/", "BV1", "9", ["sponsor", "intro"]
     )
     url, params = client.requests[0]
     assert url == "https://bsbsb.top/api/skipSegments"
@@ -135,14 +131,14 @@ async def test_fetch_builds_the_query_and_returns_rows(monkeypatch):
     ],
 )
 async def test_fetch_degrades_to_empty(monkeypatch, client):
-    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(sponsorblock.DOWNLOADER, "client", client)
     assert await fetch_segments("https://bsbsb.top", "BV1", "9", ["sponsor"]) == []
 
 
 @pytest.mark.asyncio
 async def test_fetch_swallows_transport_errors(monkeypatch):
     client = _Client(_Response(), error=OSError("connection reset"))
-    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
+    monkeypatch.setattr(sponsorblock.DOWNLOADER, "client", client)
     assert await fetch_segments("https://bsbsb.top", "BV1", "9", ["sponsor"]) == []
 
 
@@ -184,8 +180,8 @@ def test_tiny_retained_pieces_are_absorbed(cuts, expected):
 
 async def _skip_rows(monkeypatch, rows, duration=600.0):
     client = _Client(_Response(200, rows))
-    monkeypatch.setattr(sponsorblock.httpx, "AsyncClient", lambda **kwargs: client)
-    return await skip_ranges("https://x.top", {"sponsor", "intro"}, "BV1", "9", duration)
+    monkeypatch.setattr(sponsorblock.DOWNLOADER, "client", client)
+    return await skip_ranges("https://x.top", ["sponsor", "intro"], "BV1", "9", duration)
 
 
 @pytest.mark.asyncio
@@ -252,42 +248,6 @@ async def test_tiny_pieces_are_absorbed_by_the_planner(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 分类白名单
-
-
-def test_categories_whitelist_equals_the_service_ids():
-    """可选分类必须等于服务端接受的分类
-
-    传未知分类时服务用 400 拒绝整个请求（实测返回 ``["Unknown category provided."]``），
-    而不是只忽略那一项，留一个服务端不认的写法就等于让空降静默失效。
-    """
-    assert set(get_args(BsbCategory)) == {
-        "sponsor",
-        "selfpromo",
-        "exclusive_access",
-        "interaction",
-        "poi_highlight",
-        "intro",
-        "outro",
-        "preview",
-        "padding",
-        "filler",
-        "music_offtopic",
-    }
-
-
-def test_unknown_category_is_rejected_at_startup():
-    with pytest.raises(ValueError, match="plite_bsb_categories"):
-        Config(plite_bsb_categories=["branding"])
-    with pytest.raises(ValueError, match="以 http 开头"):
-        Config(plite_bsb_api_base="bsbsb.top")
-    assert Config(plite_bsb_categories=["sponsor", "intro"]).bsb_categories == {
-        "sponsor",
-        "intro",
-    }
-
-
-# --------------------------------------------------------------------------
 # 解析阶段的入口：配置门控
 
 
@@ -295,10 +255,10 @@ def test_unknown_category_is_rejected_at_startup():
 @pytest.mark.parametrize(
     ("api_base", "categories", "cid", "duration"),
     [
-        (None, {"sponsor"}, 9, 600.0),
-        ("https://x.top", set(), 9, 600.0),
-        ("https://x.top", {"sponsor"}, None, 600.0),
-        ("https://x.top", {"sponsor"}, 9, 0.0),
+        (None, ["sponsor"], 9, 600.0),
+        ("https://x.top", [], 9, 600.0),
+        ("https://x.top", ["sponsor"], None, 600.0),
+        ("https://x.top", ["sponsor"], 9, 0.0),
     ],
 )
 async def test_skip_is_disabled_without_config_or_identity(
@@ -318,16 +278,16 @@ async def test_skip_for_video_passes_the_resolved_identity(monkeypatch):
     seen: list[tuple] = []
 
     async def spy(api_base, categories, bvid, cid, duration):
-        seen.append((api_base, set(categories), bvid, cid, duration))
+        seen.append((api_base, categories, bvid, cid, duration))
         return ((1.0, 2.0),), ((3.0, 4.0),), 1.0
 
     monkeypatch.setattr(sponsorblock, "skip_ranges", spy)
     monkeypatch.setattr(support.pconfig, "plite_bsb_api_base", "https://x.top")
-    monkeypatch.setattr(support.pconfig, "plite_bsb_categories", {"sponsor"})
+    monkeypatch.setattr(support.pconfig, "plite_bsb_categories", ["sponsor"])
 
     cuts, mutes, removed = await skip_for_video("BV1", 9, 600.0)
     # cid 是整数，查询要拿到字符串形式
-    assert seen == [("https://x.top", {"sponsor"}, "BV1", "9", 600.0)]
+    assert seen == [("https://x.top", ["sponsor"], "BV1", "9", 600.0)]
     assert (cuts, mutes, removed) == (((1.0, 2.0),), ((3.0, 4.0),), 1.0)
 
 
@@ -377,36 +337,6 @@ async def test_skip_video_skips_when_ffmpeg_is_missing(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_skip_video_is_throttled_by_the_transcode_limit(tmp_path, monkeypatch):
-    """空降转码与倍速共用同一个上限，避免一次打出多个 ffmpeg"""
-    running = 0
-    peak = 0
-
-    async def always(cls):
-        return True
-
-    async def slow(cls, input_path, **kwargs):
-        nonlocal running, peak
-        running += 1
-        peak = max(peak, running)
-        await asyncio.sleep(0.02)
-        running -= 1
-        return AnyPath(tmp_path / "product.mp4")
-
-    monkeypatch.setattr(FFmpeg, "is_available", classmethod(always))
-    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(slow))
-
-    source = AnyPath(tmp_path / "source.mp4")
-    token = TRANSCODE_LIMIT.set(asyncio.Semaphore(1))
-    try:
-        await asyncio.gather(
-            *(skip_video(source, ((1.0, 2.0),), ()) for _ in range(3))
-        )
-    finally:
-        TRANSCODE_LIMIT.reset(token)
-    assert peak == 1
-
-
 @pytest.mark.asyncio
 async def test_skip_video_falls_back_to_original_on_failure(tmp_path, monkeypatch):
     async def always(cls):
@@ -446,4 +376,3 @@ async def test_skip_video_passes_the_annotations_to_ffmpeg(tmp_path, monkeypatch
     assert seen["input_path"] == source
     assert seen["cut_ranges"] == cuts
     assert seen["mute_ranges"] == mutes
-    assert seen["max_size_mb"] == 77

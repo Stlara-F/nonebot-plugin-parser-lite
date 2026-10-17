@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, TypedDict
@@ -14,8 +13,7 @@ from .download import DOWNLOADER
 from .download.task import DownloadTaskWrapper
 from .exception import SizeLimitException
 from .utils.cache import CacheManager
-from .utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
-from .utils.format import format_duration
+from .utils.ffmpeg import FFmpeg, get_transcode_limit
 
 ImageLayout = Literal["grid", "x"]
 
@@ -53,9 +51,7 @@ class MediaContent:
         if self._size_bytes > max_size_bytes:
             raise SizeLimitException(self._size_bytes / 1024 / 1024)
 
-        if self.speedup == 1.0:
-            return path
-        return await self.apply_speedup(path)
+        return path if self.speedup == 1.0 else await self.apply_speedup(path)
 
     async def apply_speedup(self, path: Path) -> Path:
         """按倍速产出上传用的文件；缺 ffmpeg 或失败都退回原片并丢掉倍速"""
@@ -64,7 +60,7 @@ class MediaContent:
             self.speedup = 1.0
             return path
         try:
-            async with TRANSCODE_LIMIT.get() or contextlib.nullcontext():
+            async with get_transcode_limit():
                 return await self.retime(path, self.speedup)
         except Exception as e:
             logger.warning(f"上传前倍速失败，改用原始文件: {type(e).__name__}: {e!r}")
@@ -121,7 +117,19 @@ class AudioContent(MediaContent):
 
     @property
     def display_duration(self) -> str:
-        return format_duration(self.duration / self.speedup)
+        try:
+            total_seconds = int(self.duration / self.speedup)
+            if total_seconds <= 0:
+                return "0:00"
+
+            minutes, seconds = divmod(total_seconds, 60)
+            if minutes < 60:
+                return f"{minutes}:{seconds:02d}"
+
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        except (TypeError, ValueError):
+            return "NaN"
 
     async def get_display_size(self) -> str:
         # 变速后的体积只能等比估，``~`` 前缀表示近似值
@@ -130,9 +138,7 @@ class AudioContent(MediaContent):
         return await MediaContent.get_display_size(self)
 
     async def retime(self, path: Path, ratio: float) -> Path:
-        return await FFmpeg.edit_audio(
-            path, speed_ratio=ratio, max_size_mb=pconfig.max_size
-        )
+        return await FFmpeg.edit_audio(path, speed_ratio=ratio)
 
 
 @dataclass(repr=False, slots=True)
@@ -149,7 +155,19 @@ class VideoContent(MediaContent):
 
     @property
     def display_duration(self) -> str:
-        return format_duration(self.duration / self.speedup)
+        try:
+            total_seconds = int(self.duration / self.speedup)
+            if total_seconds <= 0:
+                return "0:00"
+
+            minutes, seconds = divmod(total_seconds, 60)
+            if minutes < 60:
+                return f"{minutes}:{seconds:02d}"
+
+            hours, minutes = divmod(minutes, 60)
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        except (TypeError, ValueError):
+            return "NaN"
 
     async def get_display_size(self) -> str:
         # 变速后的体积只能等比估，``~`` 前缀表示近似值
@@ -158,9 +176,7 @@ class VideoContent(MediaContent):
         return await MediaContent.get_display_size(self)
 
     async def retime(self, path: Path, ratio: float) -> Path:
-        return await FFmpeg.edit_video(
-            path, speed_ratio=ratio, max_size_mb=pconfig.max_size
-        )
+        return await FFmpeg.edit_video(path, speed_ratio=ratio)
 
 
 @dataclass(repr=False, slots=True)

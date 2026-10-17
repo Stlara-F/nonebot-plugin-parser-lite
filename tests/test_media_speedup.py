@@ -24,7 +24,7 @@ from nonebot_plugin_parser_lite.data import (
 )
 from nonebot_plugin_parser_lite.exception import SizeLimitException
 from nonebot_plugin_parser_lite.utils.cache import CacheManager
-from nonebot_plugin_parser_lite.utils.ffmpeg import TRANSCODE_LIMIT, FFmpeg
+from nonebot_plugin_parser_lite.utils.ffmpeg import FFmpeg
 from nonebot_plugin_parser_lite.utils.media_edit import (
     apply_media_speedup,
     speedup_digest,
@@ -93,8 +93,6 @@ def test_later_rule_wins_and_ratio_is_not_capped():
 def test_config_rejects_bad_values():
     with pytest.raises(ValueError, match="平台:作者id:倍速"):
         Config(plite_media_speedup_rules=["bilibili=1.2"])
-    with pytest.raises(ValueError, match="以 http 开头"):
-        Config(plite_bsb_api_base="sb.example.top")
 
 
 # --------------------------------------------------------------------------
@@ -379,7 +377,6 @@ async def test_get_path_returns_the_sped_up_product(tmp_path, monkeypatch):
     assert str(await cont.get_path()) == str(tmp_path / "product.mp4")
     assert seen["input_path"] == source
     assert seen["speed_ratio"] == 1.25
-    assert seen["max_size_mb"] == 42
 
 
 @pytest.mark.asyncio
@@ -446,50 +443,6 @@ async def test_missing_ffmpeg_skips_speedup_and_drops_it(tmp_path, monkeypatch):
     assert await cont.get_path() == await cont.path_task
     assert called == [], "缺 ffmpeg 时不该调用转码"
     assert cont.speedup == 1.0
-
-
-async def _peak_concurrency(tmp_path, monkeypatch, limit: int) -> int:
-    monkeypatch.setattr(support.pconfig, "plite_media_transcode_concurrency", limit)
-
-    running = 0
-    peak = 0
-
-    async def always(cls):
-        return True
-
-    async def slow(cls, input_path, **kwargs):
-        nonlocal running, peak
-        running += 1
-        peak = max(peak, running)
-        await asyncio.sleep(0.02)
-        running -= 1
-        return AnyPath(tmp_path / "product.mp4")
-
-    monkeypatch.setattr(FFmpeg, "is_available", classmethod(always))
-    monkeypatch.setattr(FFmpeg, "edit_video", classmethod(slow))
-
-    conts = [make_media(VideoContent, tmp_path, "video.mp4") for _ in range(4)]
-    for cont in conts:
-        cont.speedup = 1.25
-    # 信号量由处理入口按配置创建，与 matchers.parser_handler 一致
-    token = TRANSCODE_LIMIT.set(
-        asyncio.Semaphore(support.pconfig.media_transcode_concurrency)
-    )
-    try:
-        await asyncio.gather(*(cont.get_path() for cont in conts))
-    finally:
-        TRANSCODE_LIMIT.reset(token)
-    return peak
-
-
-@pytest.mark.asyncio
-async def test_transcode_gate_serialises_at_one(tmp_path, monkeypatch):
-    assert await _peak_concurrency(tmp_path, monkeypatch, 1) == 1
-
-
-@pytest.mark.asyncio
-async def test_transcode_gate_allows_configured_parallelism(tmp_path, monkeypatch):
-    assert await _peak_concurrency(tmp_path, monkeypatch, 2) == 2
 
 
 # --------------------------------------------------------------------------

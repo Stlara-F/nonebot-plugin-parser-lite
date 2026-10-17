@@ -18,7 +18,7 @@ from nonebot_plugin_alconna.uniseg import (
 )
 from nonebot_plugin_alconna.uniseg.segment import Media
 
-from .config import pconfig
+from .config import gconfig, pconfig
 from .data import ParseResult
 from .helper import media_role
 from .render import (
@@ -64,7 +64,7 @@ def _copy_node(node: CustomNode, content: UniMessage) -> CustomNode:
 
 
 def _node_content(node: CustomNode) -> str | UniMessage:
-    """纯文字恢复为普通发送的字符串输入，混合图文保留消息段。"""
+    """纯文字恢复为普通发送的字符串输入，混合图文保留消息段"""
     content = UniMessage(node.content)
     if all(isinstance(segment, Text) for segment in content):
         return content.extract_plain_text()
@@ -223,12 +223,11 @@ async def send_with_media_fallback(
     )
     try:
         upload_timeout = pconfig.file_upload_timeout
-        send_kwargs = (
-            {"_timeout": upload_timeout}
-            if upload_timeout is not None and message.has(File)
-            else {}
+        await message.send(
+            _timeout=upload_timeout
+            if upload_timeout and message.has(File)
+            else gconfig.api_timeout
         )
-        await message.send(**send_kwargs)
     except ActionFailed as error:
         if snapshot is None or result is None or not is_media_upload_error(error):
             raise
