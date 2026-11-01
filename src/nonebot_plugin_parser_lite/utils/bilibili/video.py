@@ -145,15 +145,12 @@ class Video:
         """
         if not self.info:
             req = view_pb2.ViewReq(bvid=self.bvid)
-            access_token = self.credential.access_token if self.credential else ""
             self.info = await GRPC_CLIENT.request(
                 "/bilibili.app.view.v1.View/View",
                 req,
                 view_pb2.ViewReply,
-                access_token=access_token,
-                user_mid=self.credential.mid
-                if self.credential and access_token
-                else None,
+                access_token=self.credential.access_token if self.credential else "",
+                dedeuserid=self.credential.dedeuserid if self.credential else "",
             )
         return self.info
 
@@ -244,13 +241,12 @@ class Video:
             download=0,
             force_host=2,
         )
-        access_token = self.credential.access_token if self.credential else ""
         return await GRPC_CLIENT.request(
             "/bilibili.app.playurl.v1.PlayURL/PlayView",
             req,
             playurl_pb2.PlayViewReply,
-            access_token=access_token,
-            user_mid=self.credential.mid if self.credential and access_token else None,
+            access_token=self.credential.access_token if self.credential else "",
+            dedeuserid=self.credential.dedeuserid if self.credential else "",
         )
 
     async def get_ai_conclusion(
@@ -278,7 +274,6 @@ class Video:
 
         params = {
             "aid": self.aid,
-            "bvid": self.bvid,
             "cid": cid,
             "up_mid": up_mid or await self.get_up_mid(),
             "web_location": "333.788",
@@ -636,7 +631,7 @@ class VideoDownloadURLDataDetecter:
 
         # 选择最优音频流：基于评分的 key 函数
         def audio_score(s: AudioStreamDownloadURL) -> int:
-            """按音频档位的选择优先级排序。"""
+            """按音频档位的选择优先级排序"""
             return s.audio_quality.selection_rank
 
         # 取最优（线性扫描）

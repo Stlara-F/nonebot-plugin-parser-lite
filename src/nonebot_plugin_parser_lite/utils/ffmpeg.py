@@ -7,18 +7,32 @@ import json
 import math
 from typing import Any
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from anyio import Path
 
+from ..config import pconfig
 from ..exception import SizeLimitException
 from .cache import CacheManager
 from .common import fmt_size
 from .log import logger
 
+_TRANSCODE_LIMITS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    WeakKeyDictionary()
+)
+
+
+def get_transcode_limit() -> asyncio.Semaphore:
+    """返回当前事件循环共享的转码信号量"""
+    loop = asyncio.get_running_loop()
+    cached = _TRANSCODE_LIMITS.get(loop)
+    if cached is None:
+        cached = asyncio.Semaphore(pconfig.media_transcode_concurrency)
+        _TRANSCODE_LIMITS[loop] = cached
+    return cached
+
 
 class FFmpeg:
-    _available: bool | None = None
-
     @classmethod
     def hash_filename(cls, *args: Path) -> str:
         """
@@ -175,8 +189,8 @@ class FFmpeg:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration:stream="
-                "codec_type,duration,avg_frame_rate,r_frame_rate",
+                "format=duration,bit_rate:stream="
+                "codec_type,duration,avg_frame_rate,r_frame_rate,bit_rate",
                 "-of",
                 "json",
                 str(media_path),
@@ -199,6 +213,30 @@ class FFmpeg:
         if not math.isfinite(duration) or duration <= 0:
             raise RuntimeError(f"无法获取有效的媒体时长: {media_path}")
         return duration
+
+    @staticmethod
+    def _get_stream_bitrate(probe: dict[str, Any], codec_type: str) -> int | None:
+        """获取编码码率"""
+        streams = probe.get("streams", [])
+        target = next(
+            (stream for stream in streams if stream.get("codec_type") == codec_type),
+            None,
+        )
+        if target is None:
+            return None
+        bitrate = int(target.get("bit_rate") or 0)
+        if bitrate > 0:
+            return bitrate
+
+        total = int(probe.get("format", {}).get("bit_rate") or 0)
+        other_rates = [
+            int(stream.get("bit_rate") or 0)
+            for stream in streams
+            if stream is not target
+        ]
+        if total > 0 and all(rate > 0 for rate in other_rates):
+            return max(0, total - sum(other_rates)) or None
+        return None
 
     @staticmethod
     def _get_video_frame_rate(probe: dict[str, Any], video_path: Path) -> str:
@@ -226,11 +264,6 @@ class FFmpeg:
     def _format_filter_number(value: float) -> str:
         return f"{value:.9f}".rstrip("0").rstrip(".")
 
-    @staticmethod
-    def _validate_live_loop(loop: int) -> None:
-        if isinstance(loop, bool) or not isinstance(loop, int) or loop < 1:
-            raise ValueError("loop 必须是大于等于 1 的整数")
-
     @classmethod
     async def _get_live_output_path(
         cls,
@@ -255,35 +288,6 @@ class FFmpeg:
         cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
         return cache_dir / f"{file_name}.mp4"
 
-    @staticmethod
-    def _build_live_inputs(video_path: Path, image_path: Path, loop: int) -> list[str]:
-        # 多读取一轮可避免部分可变帧率素材在末段 trim 时缺最后一帧
-        return [
-            "-stream_loop",
-            str(loop),
-            "-i",
-            str(video_path),
-            "-loop",
-            "1",
-            "-i",
-            str(image_path),
-        ]
-
-    @classmethod
-    def _build_live_filter(
-        cls, duration: float, video_fps: str, loop: int
-    ) -> tuple[list[str], float]:
-        fade_duration = min(0.5, max(0.12, duration * 0.18))
-        static_duration = 2.5
-        filter_parts = cls._build_live_segments(
-            duration, video_fps, static_duration, loop
-        )
-        composed_duration, last_label = cls._append_live_transitions(
-            filter_parts, duration, static_duration, fade_duration, loop
-        )
-        filter_parts.append(f"[{last_label}]null[outv]")
-        return filter_parts, composed_duration
-
     @classmethod
     def _build_live_segments(
         cls, duration: float, video_fps: str, static_duration: float, loop: int
@@ -294,7 +298,17 @@ class FFmpeg:
             "[1:v]setpts=PTS-STARTPTS,settb=1/1000,"
             f"format=yuv420p,setsar=1,fps={video_fps}[still_base]",
         ]
-        filter_parts.extend(cls._build_live_split_filters(loop))
+        if loop == 1:
+            filter_parts.extend(("[vbase]null[vsplit0]", "[still_base]null[still0]"))
+        else:
+            split_labels = "".join(f"[vsplit{i}]" for i in range(loop))
+            still_labels = "".join(f"[still{i}]" for i in range(loop))
+            filter_parts.extend(
+                (
+                    f"[vbase]split={loop}{split_labels}",
+                    f"[still_base]split={loop}{still_labels}",
+                )
+            )
 
         formatted_duration = cls._format_filter_number(duration)
         for index in range(loop):
@@ -310,18 +324,6 @@ class FFmpeg:
                 )
             )
         return filter_parts
-
-    @staticmethod
-    def _build_live_split_filters(loop: int) -> tuple[str, str]:
-        if loop == 1:
-            return "[vbase]null[vsplit0]", "[still_base]null[still0]"
-
-        split_labels = "".join(f"[vsplit{i}]" for i in range(loop))
-        still_labels = "".join(f"[still{i}]" for i in range(loop))
-        return (
-            f"[vbase]split={loop}{split_labels}",
-            f"[still_base]split={loop}{still_labels}",
-        )
 
     @classmethod
     def _append_live_transitions(
@@ -390,77 +392,19 @@ class FFmpeg:
             ["-shortest"],
         )
 
-    @staticmethod
-    def _build_live_command(
-        inputs: list[str],
-        filter_parts: list[str],
-        audio_map: list[str],
-        audio_output: list[str],
-        finish_mode: list[str],
-        output_path: Path,
-    ) -> list[str]:
-        return [
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            *inputs,
-            "-filter_complex",
-            ";".join(filter_parts),
-            "-map",
-            "[outv]",
-            *audio_map,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            *audio_output,
-            "-pix_fmt",
-            "yuv420p",
-            *finish_mode,
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-
     @classmethod
-    async def is_available(cls) -> bool:
-        if cls._available is not None:
-            return cls._available
-
-        try:
-            await cls.exec_ffmpeg(["-version"])
-        except Exception:
-            cls._available = False
-        else:
-            cls._available = True
-        return cls._available
-
-    @classmethod
-    async def png_to_jpeg(cls, png_data: bytes) -> bytes:
+    async def rgba_to_webp(cls, rgba_data: bytes, width: int, height: int) -> bytes:
+        """将 RGBA 原始像素编码为 WebP"""
         cmd = [
             "-hide_banner",
             "-loglevel",
             "error",
-            "-i",
-            "pipe:0",
             "-f",
-            "image2pipe",
-            "-c:v",
-            "mjpeg",
-            "-q:v",
-            "85",
-            "pipe:1",
-        ]
-        return await cls.exec_ffmpeg(cmd, png_data)
-
-    @classmethod
-    async def png_to_webp(cls, png_data: bytes) -> bytes:
-        """PNG to WebP"""
-        cmd = [
-            "-hide_banner",
-            "-loglevel",
-            "error",
+            "rawvideo",
+            "-pixel_format",
+            "rgba",
+            "-video_size",
+            f"{width}x{height}",
             "-i",
             "pipe:0",
             "-frames:v",
@@ -475,7 +419,7 @@ class FFmpeg:
             "85",
             "pipe:1",
         ]
-        return await cls.exec_ffmpeg(cmd, png_data)
+        return await cls.exec_ffmpeg(cmd, rgba_data)
 
     @classmethod
     async def remux_to_mp4(cls, input_path: Path, output_path: Path) -> Path:
@@ -516,7 +460,7 @@ class FFmpeg:
         max_size_mb: int = 90,
         on_progress: Callable[[int], None] | None = None,
     ) -> Path:
-        """让 ffmpeg 处理加密、初始化段和字节范围等完整 HLS 语义。"""
+        """让 ffmpeg 处理加密、初始化段和字节范围等完整 HLS 语义"""
         temp_path = cls.temporary_output_path(output_path)
         input_options: list[str] = []
         if headers:
@@ -618,7 +562,8 @@ class FFmpeg:
         :param file_name: 输出文件名
         :param loop: 视频与静态图组合的循环次数
         """
-        cls._validate_live_loop(loop)
+        if isinstance(loop, bool) or not isinstance(loop, int) or loop < 1:
+            raise ValueError("loop 必须是大于等于 1 的整数")
         has_bgm = bool(bgm_path and await bgm_path.exists())
         output_path = await cls._get_live_output_path(
             image_path, video_path, bgm_path, file_name, loop, has_bgm
@@ -637,15 +582,53 @@ class FFmpeg:
         video_probe = await cls._probe_media(video_path)
         duration = cls._get_duration(video_probe, video_path)
         video_fps = cls._get_video_frame_rate(video_probe, video_path)
-        inputs = cls._build_live_inputs(video_path, image_path, loop)
-        filter_parts, composed_duration = cls._build_live_filter(
-            duration, video_fps, loop
+        # 多读取一轮可避免部分可变帧率素材在末段 trim 时缺最后一帧
+        inputs = [
+            "-stream_loop",
+            str(loop),
+            "-i",
+            str(video_path),
+            "-loop",
+            "1",
+            "-i",
+            str(image_path),
+        ]
+        fade_duration = min(0.5, max(0.12, duration * 0.18))
+        static_duration = 2.5
+        filter_parts = cls._build_live_segments(
+            duration, video_fps, static_duration, loop
         )
-        audio_options = await cls._configure_live_audio(
+        composed_duration, last_label = cls._append_live_transitions(
+            filter_parts, duration, static_duration, fade_duration, loop
+        )
+        filter_parts.append(f"[{last_label}]null[outv]")
+        audio_map, audio_output, finish_mode = await cls._configure_live_audio(
             inputs, filter_parts, bgm_path, has_bgm, composed_duration
         )
         temp_path = cls.temporary_output_path(output_path)
-        cmd = cls._build_live_command(inputs, filter_parts, *audio_options, temp_path)
+        cmd = [
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *inputs,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[outv]",
+            *audio_map,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            *audio_output,
+            "-pix_fmt",
+            "yuv420p",
+            *finish_mode,
+            "-movflags",
+            "+faststart",
+            str(temp_path),
+        ]
         try:
             await cls.exec_ffmpeg(cmd)
             await temp_path.replace(output_path)
@@ -654,6 +637,264 @@ class FFmpeg:
         logger.success(
             f"Created Live Photo video {output_path.name}, "
             f"{await fmt_size(output_path)}"
+        )
+        return output_path
+
+    @classmethod
+    async def _get_edit_output_path(
+        cls, input_path: Path, suffix: str, *params: Any
+    ) -> Path:
+        """计算编辑产物名"""
+        cache_key = ",".join([str(input_path), *(str(param) for param in params)])
+        file_name = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+        cache_dir = await CacheManager.ensure_dir(CacheManager.MEDIA)
+        return cache_dir / f"{file_name}{suffix}"
+
+    @staticmethod
+    def _build_keep_pieces(
+        cut_ranges: tuple[tuple[float, float], ...],
+        duration: float,
+    ) -> list[tuple[float, float]]:
+        """把`要删掉的区间`换算成`要保留的区间`, 入参需已排序且不重叠"""
+        pieces: list[tuple[float, float]] = []
+        cursor = 0.0
+        for start, end in cut_ranges:
+            if start > cursor:
+                pieces.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < duration:
+            pieces.append((cursor, duration))
+        return pieces
+
+    @classmethod
+    def _build_mute_expression(
+        cls, mute_ranges: tuple[tuple[float, float], ...]
+    ) -> str:
+        terms = [
+            f"gte(t,{cls._format_filter_number(start)})*"
+            f"lt(t,{cls._format_filter_number(end)})"
+            for start, end in mute_ranges
+        ]
+        return "+".join(terms)
+
+    @classmethod
+    def _build_timeline_filter(
+        cls,
+        pieces: list[tuple[float, float]],
+        mute_ranges: tuple[tuple[float, float], ...],
+        *,
+        has_audio: bool,
+    ) -> tuple[list[str], str, str | None]:
+        """裁切并拼接保留区间
+
+        消音表达式在 split 之前作用于原始时间轴，因此消音区间不需要随裁切
+        重新映射。音频只取第一条流，多轨产物在 IM 侧基本只有第一条会被播
+
+        :return: (滤镜片段, 视频输出标签, 音频输出标签)
+        """
+        count = len(pieces)
+        parts: list[str] = []
+
+        if count == 1:
+            parts.append("[0:v]null[vc0]")
+        else:
+            labels = "".join(f"[vc{i}]" for i in range(count))
+            parts.append(f"[0:v]split={count}{labels}")
+
+        audio_source = "0:a"
+        if has_audio and mute_ranges:
+            enable = cls._build_mute_expression(mute_ranges)
+            parts.append(f"[0:a]volume=enable='{enable}':volume=0[am]")
+            audio_source = "am"
+
+        if has_audio:
+            if count == 1:
+                parts.append(f"[{audio_source}]anull[ac0]")
+            else:
+                audio_labels = "".join(f"[ac{i}]" for i in range(count))
+                parts.append(f"[{audio_source}]asplit={count}{audio_labels}")
+
+        for index, (start, end) in enumerate(pieces):
+            left = cls._format_filter_number(start)
+            right = cls._format_filter_number(end)
+            parts.append(
+                f"[vc{index}]trim=start={left}:end={right},"
+                f"setpts=PTS-STARTPTS[v{index}]"
+            )
+            if has_audio:
+                parts.append(
+                    f"[ac{index}]atrim=start={left}:end={right},"
+                    f"asetpts=PTS-STARTPTS[a{index}]"
+                )
+
+        joined = "".join(
+            f"[v{i}]" + (f"[a{i}]" if has_audio else "") for i in range(count)
+        )
+        if has_audio:
+            parts.append(f"{joined}concat=n={count}:v=1:a=1[vt][at]")
+            return parts, "[vt]", "[at]"
+        parts.append(f"{joined}concat=n={count}:v=1:a=0[vt]")
+        return parts, "[vt]", None
+
+    @classmethod
+    async def edit_video(
+        cls,
+        input_path: Path,
+        speed_ratio: float = 1.0,
+        cut_ranges: tuple[tuple[float, float], ...] = (),
+        mute_ranges: tuple[tuple[float, float], ...] = (),
+    ) -> Path:
+        """倍速或修剪视频
+
+        :param input_path: 源视频路径
+        :param speed_ratio: 播放倍速
+        :param cut_ranges: 需要删除的时间轴区间
+        :param mute_ranges: 需要消音的时间轴区间
+        :return: 产物路径
+        """
+        output_path = await cls._get_edit_output_path(
+            input_path,
+            ".mp4",
+            speed_ratio,
+            cut_ranges,
+            mute_ranges,
+            "source-bitrate-v1",
+        )
+        if await output_path.exists():
+            return output_path
+
+        probe = await cls._probe_media(input_path)
+        duration = cls._get_duration(probe, input_path)
+        has_audio = any(
+            stream.get("codec_type") == "audio" for stream in probe.get("streams", [])
+        )
+
+        pieces = (
+            cls._build_keep_pieces(cut_ranges, duration)
+            if cut_ranges
+            else [(0.0, duration)]
+        )
+        if not pieces:
+            raise RuntimeError("裁切后没有剩余片段")
+        needs_trim = bool(cut_ranges)
+
+        filter_parts: list[str] = []
+        video_source, video_target = "[0:v]", "0:v"
+        audio_source = "[0:a]" if has_audio else None
+        audio_target = "0:a" if has_audio else None
+
+        if needs_trim:
+            filter_parts, video_target, audio_target = cls._build_timeline_filter(
+                pieces, mute_ranges, has_audio=has_audio
+            )
+            video_source, audio_source = video_target, audio_target
+        elif has_audio and mute_ranges:
+            enable = cls._build_mute_expression(mute_ranges)
+            filter_parts.append(f"[0:a]volume=enable='{enable}':volume=0[at]")
+            audio_source = audio_target = "[at]"
+
+        video_filtered = needs_trim or speed_ratio != 1.0
+        if speed_ratio != 1.0:
+            ratio = cls._format_filter_number(speed_ratio)
+            filter_parts.append(f"{video_source}setpts=PTS/{ratio}[vf]")
+            video_source = video_target = "[vf]"
+            if audio_source is not None:
+                filter_parts.append(f"{audio_source}atempo={ratio}[af]")
+                audio_source = audio_target = "[af]"
+
+        cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
+        cmd += ["-i", str(input_path)]
+        if filter_parts:
+            cmd += ["-filter_complex", ";".join(filter_parts)]
+        cmd += ["-map", video_target]
+        if video_filtered:
+            cmd += [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+            if bitrate := cls._get_stream_bitrate(probe, "video"):
+                cmd += [
+                    "-b:v",
+                    str(bitrate),
+                    "-maxrate",
+                    str(bitrate),
+                    "-bufsize",
+                    str(bitrate * 2),
+                ]
+        else:
+            cmd += ["-c:v", "copy"]
+        if audio_target is None:
+            cmd += ["-an"]
+        else:
+            cmd += ["-map", audio_target]
+            if audio_target == "0:a":
+                cmd += ["-c:a", "copy"]
+            else:
+                cmd += ["-c:a", "aac"]
+                if bitrate := cls._get_stream_bitrate(probe, "audio"):
+                    cmd += ["-b:a", str(bitrate)]
+        logger.info(f"Editing video '{input_path.name}' as '{output_path.name}'")
+        temp_path = cls.temporary_output_path(output_path)
+        cmd += ["-movflags", "+faststart", str(temp_path)]
+        try:
+            await cls.exec_ffmpeg_monitored(
+                cmd, output_path=temp_path, max_size_mb=pconfig.max_size
+            )
+            await temp_path.replace(output_path)
+        finally:
+            await temp_path.unlink(missing_ok=True)
+        logger.success(
+            f"Edited video {output_path.name}, size={await fmt_size(output_path)}"
+        )
+        return output_path
+
+    @classmethod
+    async def change_audio_speed(
+        cls,
+        input_path: Path,
+        speed_ratio: float,
+    ) -> Path:
+        """倍速处理音频
+
+        :param input_path: 音频路径
+        :param speed_ratio: 播放倍速
+        :return: 产物路径
+        """
+        suffix = input_path.suffix.lower() or ".m4a"
+        output_path = await cls._get_edit_output_path(
+            input_path, suffix, speed_ratio, "source-bitrate-v1"
+        )
+        if await output_path.exists():
+            return output_path
+
+        probe = await cls._probe_media(input_path)
+        cmd: list[str] = ["-y", "-hide_banner", "-loglevel", "error"]
+        cmd += [
+            "-i",
+            str(input_path),
+            "-vn",
+            "-af",
+            f"atempo={cls._format_filter_number(speed_ratio)}",
+        ]
+        # 编码器按输出后缀决定，码率沿用源音频
+        if bitrate := cls._get_stream_bitrate(probe, "audio"):
+            cmd += ["-b:a", str(bitrate)]
+        logger.info(f"Editing audio '{input_path.name}' as '{output_path.name}'")
+        temp_path = cls.temporary_output_path(output_path)
+        cmd += [str(temp_path)]
+        try:
+            await cls.exec_ffmpeg_monitored(
+                cmd, output_path=temp_path, max_size_mb=pconfig.max_size
+            )
+            await temp_path.replace(output_path)
+        finally:
+            await temp_path.unlink(missing_ok=True)
+        logger.success(
+            f"Edited audio {output_path.name}, size={await fmt_size(output_path)}"
         )
         return output_path
 

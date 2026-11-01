@@ -1,18 +1,17 @@
-"""Text-only parsing pipeline for the standalone build."""
-
 from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
-from typing import Any, Self, overload
+from typing import Literal, Self, overload
 
 from .config import pconfig
 from .constants import MatchWithParams
 from .data import ParseResult
 from .exception import ParseException
 from .parsers.base import BaseParser
+from .render import ThemeData, render_theme_data, resolve_parse_result
 from .utils.common import LimitedSizeDict
 from .utils.log import logger
 from .utils.scheduler import scheduler
@@ -35,17 +34,37 @@ async def _clean_runtime_cache() -> None:
     clear_result_cache()
 
 
+_runtime_started = False
+
+
 def _ensure_runtime_started() -> None:
+    global _runtime_started
     scheduler.add_job(
         _clean_runtime_cache,
         seconds=2 * 60 * 60,
         id=_CACHE_JOB_ID,
     )
+    if _runtime_started:
+        return
+    _runtime_started = True
+
+    import asyncio
+
+    from .render.image import warmup_themes
+    from .utils.cache import CacheManager
+
+    async def _warmup() -> None:
+        await CacheManager.warmup_all()
+        await warmup_themes()
+
+    asyncio.get_running_loop().create_task(_warmup())
 
 
 async def shutdown_runtime() -> None:
     from .download import DOWNLOADER
 
+    global _runtime_started
+    _runtime_started = False
     await scheduler.shutdown()
     await DOWNLOADER.aclose()
     clear_result_cache()
@@ -54,6 +73,8 @@ async def shutdown_runtime() -> None:
 class ParseStep(StrEnum):
     MATCH = "match"
     PARSE = "parse"
+    RESOLVE = "resolve"
+    RENDER = "render"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +94,16 @@ class MatchResult:
 
     @property
     def cache_key(self) -> str:
-        return f"{self.keyword}:{self.searched.cache_key}"
+        return self.searched.cache_key
+
+
+@dataclass(frozen=True, slots=True)
+class RenderResult:
+    """Rendered image together with the parsed post and its downloadable media."""
+
+    result: ParseResult
+    image_format: Literal["jpeg", "webp"]
+    image: bytes
 
 
 class Parser:
@@ -103,22 +133,15 @@ class Parser:
 
         patterns = sorted(
             (
-                (keyword, pattern, rules, parser_type)
+                (rule, parser_type)
                 for parser_type in self._types()
-                for keyword, pattern, rules in parser_type._key_patterns
+                for rule in parser_type._key_patterns
             ),
-            key=lambda item: -len(item[0]),
+            key=lambda item: -len(item[0].keyword),
         )
-        for keyword, pattern, rules, parser_type in patterns:
-            if keyword not in text:
-                continue
-            matched = pattern.search(text)
-            if matched is None:
-                continue
-            searched = MatchWithParams(matched)
-            searched.param_rules = rules
-            if parser_type._match_param_rules(searched, rules):
-                return MatchResult(text, keyword, searched, parser_type)
+        for rule, parser_type in patterns:
+            if searched := rule.match(text):
+                return MatchResult(text, rule.keyword, searched, parser_type)
         raise ParseException("文本中没有可解析的内容")
 
     def _instance(self, parser_type: type[BaseParser]) -> BaseParser:
@@ -128,29 +151,96 @@ class Parser:
 
     @overload
     async def parse(
-        self, text: str, *, until: ParseStep = ParseStep.PARSE
+        self,
+        source: str | MatchResult,
+        *,
+        until: Literal[ParseStep.MATCH, "match"],
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
+    ) -> MatchResult: ...
+
+    @overload
+    async def parse(
+        self,
+        source: str | MatchResult | ParseResult,
+        *,
+        until: Literal[ParseStep.PARSE, "parse"] = ParseStep.PARSE,
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
     ) -> ParseResult: ...
 
     @overload
-    async def parse(self, text: str, *, until: str) -> Any: ...
+    async def parse(
+        self,
+        source: str | MatchResult | ParseResult,
+        *,
+        until: Literal[ParseStep.RESOLVE, "resolve"],
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
+    ) -> ThemeData: ...
+
+    @overload
+    async def parse(
+        self,
+        source: str | MatchResult | ParseResult,
+        *,
+        until: Literal[ParseStep.RENDER, "render"],
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
+    ) -> RenderResult: ...
+
+    @overload
+    async def parse(
+        self,
+        source: str | MatchResult | ParseResult,
+        *,
+        until: ParseStep | str,
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
+    ) -> MatchResult | ParseResult | ThemeData | RenderResult: ...
 
     async def parse(
-        self, text: str, *, until: ParseStep | str = ParseStep.PARSE
-    ) -> Any:
+        self,
+        source: str | MatchResult | ParseResult,
+        *,
+        until: ParseStep | str = ParseStep.PARSE,
+        color_scheme: str | None = None,
+        theme_id: str | None = None,
+        image_format: Literal["jpeg", "webp"] | None = None,
+    ) -> MatchResult | ParseResult | ThemeData | RenderResult:
         _ensure_runtime_started()
         step = ParseStep(until)
-        matched = self.match(text)
-        if step is ParseStep.MATCH:
-            return matched
-
-        result = _RESULT_CACHE.get(matched.cache_key)
-        if result is None:
-            parser = self._instance(matched.parser_type)
-            result = await parser.parse(matched.keyword, matched.searched)
-            _RESULT_CACHE[matched.cache_key] = result
+        if isinstance(source, ParseResult):
+            if step is ParseStep.MATCH:
+                raise ValueError("Cannot resume a ParseResult at the match stage")
+            result = source
         else:
-            logger.debug("命中解析结果缓存: %s", matched.cache_key)
-        return result
+            matched = self.match(source) if isinstance(source, str) else source
+            if step is ParseStep.MATCH:
+                return matched
+            result = _RESULT_CACHE.get(matched.cache_key)
+            if result is None:
+                parser = self._instance(matched.parser_type)
+                result = await parser.parse(matched.keyword, matched.searched)
+                _RESULT_CACHE[matched.cache_key] = result
+            else:
+                logger.debug("命中解析结果缓存: %s", matched.cache_key)
+        if step is ParseStep.PARSE:
+            return result
+        resolved = await resolve_parse_result(
+            result, color_scheme=color_scheme, theme_id=theme_id
+        )
+        if step is ParseStep.RESOLVE:
+            return resolved
+        actual_format, image = await render_theme_data(
+            resolved, image_format=image_format
+        )
+        return RenderResult(result, actual_format, image)
 
     async def aclose(self) -> None:
         for parser in self._instances.values():
@@ -170,11 +260,80 @@ def match(
     return Parser(parser_types).match(text)
 
 
+@overload
 async def parse(
-    text: str,
+    source: str | MatchResult,
+    *,
+    until: Literal[ParseStep.MATCH, "match"],
+    parser_types: Sequence[type[BaseParser]] | None = None,
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> MatchResult: ...
+
+
+@overload
+async def parse(
+    source: str | MatchResult | ParseResult,
+    *,
+    until: Literal[ParseStep.PARSE, "parse"] = ParseStep.PARSE,
+    parser_types: Sequence[type[BaseParser]] | None = None,
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> ParseResult: ...
+
+
+@overload
+async def parse(
+    source: str | MatchResult | ParseResult,
+    *,
+    until: Literal[ParseStep.RESOLVE, "resolve"],
+    parser_types: Sequence[type[BaseParser]] | None = None,
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> ThemeData: ...
+
+
+@overload
+async def parse(
+    source: str | MatchResult | ParseResult,
+    *,
+    until: Literal[ParseStep.RENDER, "render"],
+    parser_types: Sequence[type[BaseParser]] | None = None,
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> RenderResult: ...
+
+
+@overload
+async def parse(
+    source: str | MatchResult | ParseResult,
+    *,
+    until: ParseStep | str,
+    parser_types: Sequence[type[BaseParser]] | None = None,
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> MatchResult | ParseResult | ThemeData | RenderResult: ...
+
+
+async def parse(
+    source: str | MatchResult | ParseResult,
     *,
     until: ParseStep | str = ParseStep.PARSE,
     parser_types: Sequence[type[BaseParser]] | None = None,
-) -> Any:
+    color_scheme: str | None = None,
+    theme_id: str | None = None,
+    image_format: Literal["jpeg", "webp"] | None = None,
+) -> MatchResult | ParseResult | ThemeData | RenderResult:
     async with Parser(parser_types) as parser:
-        return await parser.parse(text, until=until)
+        return await parser.parse(
+            source,
+            until=until,
+            color_scheme=color_scheme,
+            theme_id=theme_id,
+            image_format=image_format,
+        )

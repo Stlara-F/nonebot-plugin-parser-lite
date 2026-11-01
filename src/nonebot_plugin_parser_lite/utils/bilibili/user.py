@@ -153,15 +153,12 @@ class User:
             local_time=local_time,
             page=page,
         )
-        access_token = self.credential.access_token if self.credential else ""
         return await GRPC_CLIENT.request(
             "/bilibili.app.dynamic.v2.Dynamic/DynSpace",
             request,
             dynamic_pb2.DynSpaceRsp,
-            access_token=access_token,
-            user_mid=(
-                self.credential.mid if self.credential and access_token else None
-            ),
+            access_token=self.credential.access_token if self.credential else "",
+            dedeuserid=self.credential.dedeuserid if self.credential else "",
         )
 
     async def get_videos(
@@ -210,8 +207,13 @@ async def get_black_list(
     result = (
         await HTTP_CLIENT.get(
             url="https://api.bilibili.com/x/relation/blacks",
-            params={"ps": page_size, "pn": page_index},
-            cookies=credential.get_cookies(),
+            params=enc_app_sign(
+                {
+                    "access_key": credential.access_token,
+                    "ps": page_size,
+                    "pn": page_index,
+                }
+            ),
         )
     ).json()
     if result["code"] != 0:

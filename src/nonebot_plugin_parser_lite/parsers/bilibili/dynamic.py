@@ -61,19 +61,19 @@ def _apply_stat(result: ParseResult, stat: dynamic_pb2.ModuleStat) -> None:
         result.stats.comment_count = format_num(stat.reply)
 
 
-def _video_url(bvid: str, avid: int) -> str | None:
-    if bvid:
-        return f"https://www.bilibili.com/video/{bvid}"
-    return f"https://www.bilibili.com/video/av{avid}" if avid else None
+# def _video_url(bvid: str, avid: int) -> str | None:
+#     if bvid:
+#         return f"https://www.bilibili.com/video/{bvid}"
+#     return f"https://www.bilibili.com/video/av{avid}" if avid else None
 
 
 def _append_archive(result: ParseResult, archive: dynamic_pb2.MdlDynArchive) -> None:
     if archive.title and result.title is None:
         result.title = archive.title
-    if archive.jump_url.startswith("http"):
-        result.url = archive.jump_url
-    elif archive_url := _video_url(archive.bvid, archive.avid):
-        result.url = archive_url
+    # if archive.jump_url.startswith("http"):
+    #     result.url = archive.jump_url
+    # elif archive_url := _video_url(archive.bvid, archive.avid):
+    #     result.url = archive_url
     if archive.cover:
         result.content.append(Creator.graphic(url=archive.cover))
 
@@ -114,7 +114,7 @@ def _text_node_items(
 
 
 def _text_node_plain_text(nodes: Iterable[dynamic_pb2.TextNode]) -> str:
-    """提取文本节点中的原始文字，并保留节点携带的换行。"""
+    """提取文本节点中的原始文字，并保留节点携带的换行"""
     parts: list[str] = []
     for node in nodes:
         kind = node.WhichOneof("text")

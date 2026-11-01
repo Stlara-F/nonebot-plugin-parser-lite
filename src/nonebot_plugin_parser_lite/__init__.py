@@ -5,19 +5,37 @@ platform module directly, or use ``Parser`` for lazy discovery.
 """
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-__version__ = "1.3.10rc4"
+if TYPE_CHECKING:
+    from .config import Config, configure
+    from .pipeline import (
+        MatchResult,
+        Parser,
+        ParseStep,
+        RenderResult,
+        clear_result_cache,
+        match,
+        parse,
+        shutdown_runtime,
+    )
+    from .render import ThemeData, render_theme_data, resolve_parse_result
+
+__version__ = "1.4.0rc2"
 
 __all__ = [
     "Config",
     "MatchResult",
     "ParseStep",
     "Parser",
+    "RenderResult",
+    "ThemeData",
     "clear_result_cache",
     "configure",
     "match",
     "parse",
+    "render_theme_data",
+    "resolve_parse_result",
     "shutdown_runtime",
 ]
 
@@ -27,9 +45,13 @@ _EXPORTS = {
     "MatchResult": (".pipeline", "MatchResult"),
     "ParseStep": (".pipeline", "ParseStep"),
     "Parser": (".pipeline", "Parser"),
+    "RenderResult": (".pipeline", "RenderResult"),
+    "ThemeData": (".render", "ThemeData"),
     "clear_result_cache": (".pipeline", "clear_result_cache"),
     "match": (".pipeline", "match"),
     "parse": (".pipeline", "parse"),
+    "render_theme_data": (".render", "render_theme_data"),
+    "resolve_parse_result": (".render", "resolve_parse_result"),
     "shutdown_runtime": (".pipeline", "shutdown_runtime"),
 }
 

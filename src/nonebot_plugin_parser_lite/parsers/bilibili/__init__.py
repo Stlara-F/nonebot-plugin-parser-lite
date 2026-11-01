@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator, Iterable
+from dataclasses import dataclass
 from typing import ClassVar
 
 import aiofiles
@@ -55,13 +56,51 @@ from .dynamic import (
     _append_opus_summary,
     _append_paragraph,
     _apply_stat,
-    # _description_items,
     _parse_timestamp,
     _text_node_plain_text,
     build_dynamic,
 )
 from .size import probe_source_size
+from .sponsorblock import SponsorBlock
 from .video import AIConclusion
+
+
+@dataclass(slots=True)
+class BiliVideoDownloader:
+    """下载 B 站视频，并在下载完成后按空降标注生成成片"""
+
+    video_urls: tuple[str, ...]
+    audio_urls: tuple[str, ...] | None
+    ext_headers: dict[str, str]
+    retryable_http_statuses: frozenset[int]
+    cache_key: str
+    sponsorblock: SponsorBlock
+
+    @property
+    def url(self) -> str:
+        return self.video_urls[0]
+
+    async def __call__(self) -> Path:
+        if self.audio_urls:
+            source_path = await DOWNLOADER.download_av_and_merge(
+                video_url=self.url,
+                audio_url=self.audio_urls[0],
+                video_fallback_urls=self.video_urls[1:],
+                audio_fallback_urls=self.audio_urls[1:],
+                retry_http_statuses=self.retryable_http_statuses,
+                cache_key=self.cache_key,
+                ext_headers=self.ext_headers,
+            )
+        else:
+            source_path = await DOWNLOADER.download_video(
+                url=self.url,
+                fallback_urls=self.video_urls[1:],
+                retry_http_statuses=self.retryable_http_statuses,
+                cache_key=self.cache_key,
+                cache_variant="source",
+                ext_headers=self.ext_headers,
+            )
+        return await self.sponsorblock.apply(source_path)
 
 
 class BilibiliParser(BaseParser):
@@ -287,17 +326,15 @@ class BilibiliParser(BaseParser):
 
         page_index = page_num - 1
         title = arc.title
-        duration = arc.duration
         timestamp = arc.pubdate
         cover = arc.pic or None
+        page_index %= len(video_info.pages)
+        page = video_info.pages[page_index].page
+        cid = page.cid
+        duration = page.duration
+        cover = page.first_frame or cover
         if len(video_info.pages) > 1:
-            page_index %= len(video_info.pages)
-            page = video_info.pages[page_index].page
             title = f"{title} | 分集 - {page.part}"
-            duration = page.duration
-            cover = page.first_frame or cover
-        elif video_info.pages:
-            page_index = 0
 
         try:
             if self._credential:
@@ -327,46 +364,25 @@ class BilibiliParser(BaseParser):
             cache_key += f":audio:{audio_stream.audio_quality.value}"
         retryable_http_statuses = self.BILI_RETRYABLE_HTTP_STATUSES
 
-        class BiliVideoDownloader:
-            def __init__(
-                self,
-                video_urls: tuple[str, ...],
-                audio_urls: tuple[str, ...] | None,
-                ext_headers: dict[str, str] | None,
-            ):
-                self.url = video_urls[0]
-                self.video_urls = video_urls
-                self.audio_urls = audio_urls
-                self.ext_headers = ext_headers
+        sponsorblock = await SponsorBlock.query(bvid=bvid, cid=cid, duration=duration)
+        is_full_video_ad = sponsorblock.is_full_video_ad
+        if is_full_video_ad:
+            logger.info(f"空降助手标注整条视频为广告: {bvid} cid={cid}")
 
-            async def __call__(self) -> Path:
-                # 有单独音频流时，走 av 合并
-                if self.audio_urls:
-                    return await DOWNLOADER.download_av_and_merge(
-                        video_url=self.url,
-                        audio_url=self.audio_urls[0],
-                        video_fallback_urls=self.video_urls[1:],
-                        audio_fallback_urls=self.audio_urls[1:],
-                        retry_http_statuses=retryable_http_statuses,
-                        cache_key=cache_key,
-                        ext_headers=self.ext_headers,
-                    )
-                # 否则直接用流式下载
-                return await DOWNLOADER.download_video(
-                    url=self.url,
-                    fallback_urls=self.video_urls[1:],
-                    retry_http_statuses=retryable_http_statuses,
-                    cache_key=cache_key,
-                    cache_variant="source",
-                    ext_headers=self.ext_headers,
-                )
-
-        downloader = BiliVideoDownloader(video_urls, audio_urls, self.headers)
+        downloader = BiliVideoDownloader(
+            video_urls=video_urls,
+            audio_urls=audio_urls,
+            ext_headers=self.headers,
+            retryable_http_statuses=retryable_http_statuses,
+            cache_key=cache_key,
+            sponsorblock=sponsorblock,
+        )
 
         video_content = self.create_video(
             url_or_task=downloader,
             cover_url=cover,
-            duration=duration,
+            duration=sponsorblock.output_duration,
+            need_send=not sponsorblock.covers_entire_video,
             ext_headers=self.headers,
             cache_key=cache_key,
         )
@@ -412,7 +428,7 @@ class BilibiliParser(BaseParser):
                 # 如果不是BV号，直接使用
                 video_oid = int(bvid)
         except Exception as e:
-            logger.error(f"BV-AV转换失败: {e}")
+            logger.exception(f"BV-AV转换失败: {e}")
             # 转换失败时使用BV号的数值形式作为oid
             video_oid = int(bvid.replace("BV", ""), 36)
             logger.debug(f"使用备用方法获取oid: {video_oid}")
@@ -421,12 +437,18 @@ class BilibiliParser(BaseParser):
         comments = await self._fetch_comments(video_oid, CommentResourceType.VIDEO)
         processed_comments = comments
 
+        content: list[ContentItem] = [video_content, text]
+        if is_full_video_ad:
+            content.append("\n\n[视频为推广内容]")
+        elif sponsorblock.covers_entire_video:
+            content.append("\n\n[空降标注覆盖整条视频，未下载]")
+
         return self.result(
             url=url,
             title=title,
             timestamp=timestamp,
             author=author,
-            content=[video_content, text],
+            content=content,
             stats=stats,
             comments=processed_comments,
             ai_summary=ai_summary,
@@ -778,7 +800,7 @@ class BilibiliParser(BaseParser):
     ) -> list[Comment]:
         """
         从 Bilibili API 获取评论数据，优先热评，失败时兜底普通评论.
-        禁用评论获取时不请求 API，直接返回空列表。
+        禁用评论获取时不请求 API，直接返回空列表
         """
         if not pconfig.max_comments:
             return []

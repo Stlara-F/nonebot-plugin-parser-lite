@@ -46,7 +46,6 @@ class HeadResponse:
 
 class UniResponse:
     __slots__ = ("_raw",)
-    raw: CurlResponse | HttpxResponse
 
     def __init__(self, raw: CurlResponse | HttpxResponse):
         self._raw = raw
@@ -74,17 +73,7 @@ class UniResponse:
 
     @property
     def cookies(self) -> dict[str, str]:
-        """返回当前响应通过 Set-Cookie 下发的 Cookie。"""
-        raw_cookies = getattr(self._raw, "cookies", None)
-        if raw_cookies is None:
-            return {}
-        # httpx 的 Cookies 没有 get_dict()，只有 items()；curl_cffi 两者都有。
-        try:
-            return {
-                str(name): str(value) for name, value in raw_cookies.items()
-            }
-        except (AttributeError, TypeError):
-            return {}
+        return dict(self._raw.cookies.items())
 
     @property
     def is_success(self) -> bool:

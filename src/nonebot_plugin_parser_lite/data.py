@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import chain
 from typing import Any, Literal, TypedDict
 
 from anyio import Path
@@ -12,7 +15,8 @@ from .download import DOWNLOADER
 from .download.task import DownloadTaskWrapper
 from .exception import SizeLimitException
 from .utils.cache import CacheManager
-from .utils.ffmpeg import FFmpeg
+from .utils.ffmpeg import FFmpeg, get_transcode_limit
+from .utils.log import logger
 
 ImageLayout = Literal["grid", "x"]
 
@@ -34,9 +38,8 @@ class MediaContent:
 
     async def get_path(self) -> Path:
         """
-        获取媒体文件路径
+        获取媒体文件路径并检查大小上限
 
-        :raise ZeroSizeException:  文件大小为零
         :raise SizeLimitException: 文件大小超过限制
         """
         max_size_bytes = pconfig.max_size * 1024 * 1024
@@ -47,6 +50,7 @@ class MediaContent:
         self._size_bytes = (await path.stat()).st_size
         if self._size_bytes > max_size_bytes:
             raise SizeLimitException(self._size_bytes / 1024 / 1024)
+
         return path
 
     @staticmethod
@@ -87,15 +91,31 @@ class MediaContent:
 
 
 @dataclass(repr=False, slots=True)
-class AudioContent(MediaContent):
-    """音频内容"""
+class AudioVideoContent(MediaContent, ABC):
+    """支持倍速的音视频内容，子类须实现 retime"""
 
     duration: float = 0.0
+    """时长 单位: 秒"""
+    speedup: float = field(default=1.0, init=False, repr=False)
+    """上传前倍速，1.0 表示不变速；渲染层与 get_path 读同一个值"""
+
+    async def get_path(self) -> Path:
+        """获取变速产物"""
+        path = await MediaContent.get_path(self)
+        if self.speedup == 1.0:
+            return path
+        try:
+            async with get_transcode_limit():
+                return await self.retime(path, self.speedup)
+        except Exception as e:
+            logger.exception(f"倍速处理失败，改用原始文件: {type(e).__name__}: {e!r}")
+        self.speedup = 1.0
+        return path
 
     @property
     def display_duration(self) -> str:
         try:
-            total_seconds = int(self.duration)
+            total_seconds = int(self.duration / self.speedup)
             if total_seconds <= 0:
                 return "0:00"
 
@@ -108,34 +128,42 @@ class AudioContent(MediaContent):
         except (TypeError, ValueError):
             return "NaN"
 
+    async def get_display_size(self) -> str:
+        if self.speedup != 1.0 and self._size_bytes:
+            return f"~{self._format_size(int(self._size_bytes / self.speedup))}"
+        return await MediaContent.get_display_size(self)
+
+    @abstractmethod
+    async def retime(self, path: Path, ratio: float) -> Path:
+        """按倍率调整媒体时长
+
+        :param path: 源媒体文件路径
+        :param ratio: 播放倍率
+        :return: 变速后的文件路径
+        """
+        raise NotImplementedError
+
 
 @dataclass(repr=False, slots=True)
-class VideoContent(MediaContent):
+class AudioContent(AudioVideoContent):
+    """音频内容"""
+
+    async def retime(self, path: Path, ratio: float) -> Path:
+        return await FFmpeg.change_audio_speed(path, ratio)
+
+
+@dataclass(repr=False, slots=True)
+class VideoContent(AudioVideoContent):
     """视频内容"""
 
     cover: DownloadTaskWrapper[Path] | None = None
     """视频封面"""
-    duration: float = 0.0
-    """时长 单位: 秒"""
 
     async def get_cover_path(self) -> Path | None:
         return None if self.cover is None else await self.cover
 
-    @property
-    def display_duration(self) -> str:
-        try:
-            total_seconds = int(self.duration)
-            if total_seconds <= 0:
-                return "0:00"
-
-            minutes, seconds = divmod(total_seconds, 60)
-            if minutes < 60:
-                return f"{minutes}:{seconds:02d}"
-
-            hours, minutes = divmod(minutes, 60)
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        except (TypeError, ValueError):
-            return "NaN"
+    async def retime(self, path: Path, ratio: float) -> Path:
+        return await FFmpeg.edit_video(path, speed_ratio=ratio)
 
 
 @dataclass(repr=False, slots=True)
@@ -407,6 +435,13 @@ class ParseResult:
     """转发的内容"""
     render_image: Path | None = field(default=None)
     """渲染图片"""
+
+    def iter_sendable_media(self) -> Iterator[MediaContent]:
+        """依次遍历主帖和转发中需要发送的媒体"""
+        repost_content = self.repost.content if self.repost else ()
+        for content in chain(self.content, repost_content):
+            if isinstance(content, MediaContent) and content.need_send:
+                yield content
 
     @property
     def display_url(self) -> str:
